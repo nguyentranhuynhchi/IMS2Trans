@@ -18,6 +18,7 @@ import time
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 PROJECT_ROOT = Path(__file__).resolve().parent

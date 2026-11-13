@@ -117,6 +117,80 @@ class TestPipeline(unittest.TestCase):
         self.assertIn("avg_pathology_dice", metrics["summary"])
         self.assertIn("avg_pathology_inclusive_dice", metrics["summary"])
 
+    def test_train_resume_and_efficiency_metrics(self):
+        eff_run_dir = Path(self.temp_dir) / "runs" / "eff_resume_run"
+        eff_json_path = eff_run_dir / "efficiency_metrics.json"
+
+        # 1. Train Epoch 1 of 2 with efficiency measurement enabled
+        train_args_ep1 = [
+            "--data_root", str(self.data_root),
+            "--list_dir", str(self.list_dir),
+            "--output_dir", str(eff_run_dir),
+            "--seed", "1234",
+            "--batch_size", "2",
+            "--max_epochs", "2",
+            "--amp", "none",
+            "--num_workers", "0",
+            "--measure_efficiency",
+            "--efficiency_output", str(eff_json_path),
+            "--device", "cpu",
+        ]
+        train_myops.main(train_args_ep1)
+
+        ckpt_file = eff_run_dir / "checkpoints" / "ims2trans_seed1234.pt"
+        self.assertTrue(ckpt_file.is_file())
+
+        ckpt_ep1 = torch.load(ckpt_file, map_location="cpu", weights_only=False)
+        self.assertEqual(ckpt_ep1["completed_epochs"], 2)
+        self.assertTrue(ckpt_ep1["training_complete"])
+
+        # Efficiency JSON must exist and contain required keys
+        self.assertTrue(eff_json_path.is_file(), "efficiency_metrics.json must be generated!")
+        with open(eff_json_path, "r", encoding="utf-8") as f:
+            eff_data = json.load(f)
+
+        self.assertIn("excel_summary", eff_data)
+        self.assertIn("complexity", eff_data)
+        self.assertIn("inference", eff_data)
+        self.assertIn("training", eff_data)
+        self.assertIn("FLOPs (G)", eff_data["excel_summary"])
+        self.assertIn("Trainable Params (M)", eff_data["excel_summary"])
+
+        # 2. Test Resume mid-training (from 1 epoch checkpoint to 3 epochs)
+        # Create a 1-epoch checkpoint by saving completed_epochs=1
+        resume_dir = Path(self.temp_dir) / "runs" / "resume_test_run"
+        train_args_ep1_only = [
+            "--data_root", str(self.data_root),
+            "--list_dir", str(self.list_dir),
+            "--output_dir", str(resume_dir),
+            "--seed", "1234",
+            "--batch_size", "2",
+            "--max_epochs", "1",
+            "--amp", "none",
+            "--num_workers", "0",
+            "--no_measure_efficiency",
+            "--device", "cpu",
+        ]
+        train_myops.main(train_args_ep1_only)
+
+        res_ckpt_file = resume_dir / "checkpoints" / "ims2trans_seed1234.pt"
+        self.assertTrue(res_ckpt_file.is_file())
+        res_ckpt = torch.load(res_ckpt_file, map_location="cpu", weights_only=False)
+        self.assertEqual(res_ckpt["completed_epochs"], 1)
+
+        # Resume to 2 epochs
+        train_args_resume = [
+            "--resume", str(res_ckpt_file),
+            "--max_epochs", "2",
+            "--device", "cpu",
+            "--no_measure_efficiency",
+        ]
+        train_myops.main(train_args_resume)
+
+        res_ckpt_after = torch.load(res_ckpt_file, map_location="cpu", weights_only=False)
+        self.assertEqual(res_ckpt_after["completed_epochs"], 2)
+        self.assertTrue(res_ckpt_after["training_complete"])
+
 
 if __name__ == "__main__":
     unittest.main()

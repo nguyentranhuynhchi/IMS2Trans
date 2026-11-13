@@ -391,7 +391,8 @@ def _run_training(
     if resume_ckpt is not None:
         logging.info(f"Loaded checkpoint metadata from: {resume_target}")
         completed = int(resume_ckpt.get("completed_epochs", resume_ckpt.get("epoch", -1) + 1))
-        if (resume_ckpt.get("training_complete", False) or completed >= args.max_epochs) and not args.efficiency_only:
+        is_explicit_more_epochs = "max_epochs" in explicit_dests and args.max_epochs > completed
+        if not is_explicit_more_epochs and (resume_ckpt.get("training_complete", False) or completed >= args.max_epochs) and not args.efficiency_only:
             logging.info(f"Training was already marked complete at epoch {completed}/{args.max_epochs}. Nothing to run.")
             return
 
@@ -469,7 +470,7 @@ def _run_training(
             input_shape=(1, 3, args.img_size, args.img_size),
             device=device,
             warmup=30,
-            repeat=100,
+            repeats=100,
         )
         logging.info(
             f"Inference Latency: {inference_info['latency_ms_per_slice']:.2f} ms/slice | "
@@ -531,7 +532,11 @@ def _run_training(
     # Optimizer & Scheduler
     optimizer = build_optimizer(net, base_lr=args.base_lr, weight_decay=args.weight_decay)
     scheduler = build_scheduler(optimizer, total_updates=total_updates)
-    scaler = torch.cuda.amp.GradScaler(enabled=(amp_dtype == torch.float16))
+    scaler = (
+        torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16))
+        if (amp_dtype == torch.float16 and device.type == "cuda")
+        else None
+    )
 
     start_epoch = 0
     total_steps = 0
@@ -551,9 +556,10 @@ def _run_training(
         if "scheduler" in resume_ckpt or "scheduler_state_dict" in resume_ckpt:
             sched_st = resume_ckpt.get("scheduler_state_dict", resume_ckpt.get("scheduler"))
             scheduler.load_state_dict(sched_st)
-        if "scaler" in resume_ckpt or "scaler_state_dict" in resume_ckpt:
+        if scaler is not None and ("scaler" in resume_ckpt or "scaler_state_dict" in resume_ckpt):
             sc_st = resume_ckpt.get("scaler_state_dict", resume_ckpt.get("scaler"))
-            scaler.load_state_dict(sc_st)
+            if sc_st is not None:
+                scaler.load_state_dict(sc_st)
         if "epoch_times" in resume_ckpt:
             epoch_times = list(resume_ckpt["epoch_times"])
         logging.info(f"Resumed training state: Epoch {start_epoch}, Update {total_steps}")
@@ -616,17 +622,28 @@ def _run_training(
 
                 total_loss = fuse_loss + dis_loss + cos_loss + prm_loss
 
-            scaler.scale(total_loss).backward()
+            if scaler is not None:
+                scaler.scale(total_loss).backward()
+                if args.clip_grad > 0.0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(net.parameters(), args.clip_grad)
+                old_scale = scaler.get_scale()
+                scaler.step(optimizer)
+                scaler.update()
+                new_scale = scaler.get_scale()
+                if new_scale < old_scale:
+                    pass  # skipped update due to non-finite gradients
+                else:
+                    scheduler.step()
+                    total_steps += 1
+            else:
+                total_loss.backward()
+                if args.clip_grad > 0.0:
+                    torch.nn.utils.clip_grad_norm_(net.parameters(), args.clip_grad)
+                optimizer.step()
+                scheduler.step()
+                total_steps += 1
 
-            if args.clip_grad > 0.0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(net.parameters(), args.clip_grad)
-
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-
-            total_steps += 1
             epoch_steps += 1
             running_loss += total_loss.item()
             running_fuse_loss += fuse_loss.item()
@@ -670,8 +687,8 @@ def _run_training(
             "optimizer": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "scheduler": scheduler.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
-            "scaler": scaler.state_dict(),
+            "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+            "scaler": scaler.state_dict() if scaler is not None else None,
             "epoch_times": epoch_times,
             "args": vars(args),
             "seed": args.seed,
@@ -694,7 +711,7 @@ def _run_training(
             peak_res_bytes = torch.cuda.max_memory_reserved(device)
 
         training_info = summarize_training_efficiency(
-            epoch_times=epoch_times,
+            epoch_times_s=epoch_times,
             total_wall_clock_s=total_wall_clock,
             peak_vram_bytes=peak_vram_bytes,
             peak_reserved_bytes=peak_res_bytes,
@@ -715,7 +732,7 @@ def _run_training(
             hardware_info=hardware_info,
         )
         report_paths = _dedupe_paths([Path(args.efficiency_output), run_dir / "efficiency_metrics.json"])
-        save_efficiency_report(payload, report_paths)
+        save_efficiency_report(payload, report_paths, log=logging.getLogger())
 
 
 if __name__ == "__main__":

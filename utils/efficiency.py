@@ -1,4 +1,4 @@
-"""Efficiency benchmarking utilities for SAMed on MyoPS380.
+"""Efficiency benchmarking utilities for IMS2Trans on MyoPS380.
 
 Measures and exports the 7 standardized computational efficiency metrics:
   Complexity:
@@ -129,8 +129,11 @@ def measure_inference_efficiency(
     device: torch.device | None = None,
     warmup: int = 30,
     repeats: int = 100,
+    repeat: int | None = None,
 ) -> dict[str, Any]:
     """Measure Batch=1 FP32 inference latency and peak allocated VRAM in eval mode."""
+    if repeat is not None:
+        repeats = repeat
     if device is None:
         device = next(model.parameters()).device
 
@@ -187,15 +190,19 @@ def measure_inference_efficiency(
 
 
 def summarize_training_efficiency(
-    epoch_times_s: Sequence[float],
-    total_wall_clock_s: float,
-    peak_vram_bytes: int,
+    epoch_times_s: Sequence[float] | None = None,
+    total_wall_clock_s: float = 0.0,
+    peak_vram_bytes: int = 0,
     planned_epochs: int = 300,
     warmup_epochs: int = 5,
     peak_reserved_bytes: int = 0,
+    epoch_times: Sequence[float] | None = None,
 ) -> dict[str, Any]:
     """Summarize training timing (skipping first 5 epochs) and peak VRAM."""
-    times = [float(t) for t in epoch_times_s]
+    raw_times = epoch_times_s if epoch_times_s is not None else epoch_times
+    if raw_times is None:
+        raw_times = []
+    times = [float(t) for t in raw_times]
     completed_epochs = len(times)
 
     if completed_epochs > warmup_epochs:

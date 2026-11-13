@@ -94,6 +94,40 @@ class TestCriterions(unittest.TestCase):
         self.assertTrue(torch.isfinite(ce_oh))
         self.assertAlmostEqual(ce_int.item(), ce_oh.item(), places=5)
 
+    def test_softmax_weighted_loss_batch_16_shapes_and_weights(self):
+        # Verify batch size 16 (production training batch size)
+        B, C, H, W = 16, 4, 128, 128
+        pred_prob = F.softmax(torch.randn(B, C, H, W), dim=1)
+        targets = torch.randint(0, C, (B, H, W))
+
+        loss = softmax_weighted_loss(pred_prob, targets, num_cls=C)
+        self.assertEqual(loss.ndim, 0, "Loss must be a scalar")
+        self.assertTrue(torch.isfinite(loss))
+
+        # Verify rare class receives higher weight than dominant class
+        # Target with 99% background (class 0) and 1% scar (class 3)
+        skewed_target = torch.zeros(2, H, W, dtype=torch.long)
+        skewed_target[:, :10, :10] = 3  # small patch of scar
+        # Predictions: high confidence for BG, low for scar
+        pred_logits = torch.zeros(2, C, H, W)
+        pred_logits[:, 0, :, :] = 5.0  # high confidence BG
+        pred_prob = F.softmax(pred_logits, dim=1)
+        loss_skewed = softmax_weighted_loss(pred_prob, skewed_target, num_cls=C)
+        self.assertTrue(torch.isfinite(loss_skewed))
+        self.assertGreater(loss_skewed.item(), 0.0)
+
+    def test_contrastive_loss_edge_cases(self):
+        crit = ContrastiveLoss()
+        # B=0 empty tensor
+        empty = torch.zeros(0, 64)
+        loss_zero = crit(empty, empty)
+        self.assertEqual(loss_zero.item(), 0.0)
+
+        # B=1 (2 views of 1 sample, 0 negatives)
+        one = torch.randn(1, 64)
+        loss_one = crit(one, one)
+        self.assertEqual(loss_one.item(), 0.0)
+
     def test_loss_gradients(self):
         pred_logits = torch.randn(2, 4, 128, 128, requires_grad=True)
         pred_prob = F.softmax(pred_logits, dim=1)

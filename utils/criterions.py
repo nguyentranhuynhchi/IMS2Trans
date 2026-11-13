@@ -93,6 +93,9 @@ class ContrastiveLoss(nn.Module):
             z_i = emb_i
             z_j = emb_j
 
+        if B == 0:
+            return torch.tensor(0.0, device=emb_i.device, dtype=emb_i.dtype, requires_grad=True)
+
         z_i = F.normalize(z_i, dim=1)
         z_j = F.normalize(z_j, dim=1)
 
@@ -184,16 +187,17 @@ def softmax_weighted_loss(output, target, num_cls=4):
 
     C = output.shape[1]
     total_axes = tuple(range(1, target.ndim))
-    total_target_sum = torch.sum(target, dim=total_axes, keepdim=True) + 1e-8
+    total_target_sum = torch.sum(target, dim=total_axes) + 1e-8
 
     cross_loss = 0.0
     for i in range(C):
         outputi = output[:, i, ...]
         targeti = target[:, i, ...]
-        class_sum = torch.sum(targeti, dim=tuple(range(1, targeti.ndim)), keepdim=True)
+        spatial_dims = tuple(range(1, targeti.ndim))
+        class_sum = torch.sum(targeti, dim=spatial_dims)
         weighted = 1.0 - (class_sum / total_target_sum)
-        for _ in range(targeti.ndim - 1):
-            weighted = weighted.unsqueeze(-1)
+        view_shape = (targeti.shape[0],) + (1,) * len(spatial_dims)
+        weighted = weighted.view(view_shape)
         cross_loss += -1.0 * weighted * targeti * torch.log(torch.clamp(outputi, min=0.005, max=1.0)).float()
 
     return torch.mean(cross_loss)
