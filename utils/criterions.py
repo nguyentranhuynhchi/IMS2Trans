@@ -10,6 +10,10 @@ __all__ = [
     "GeneralizedDiceLoss",
     "FocalLoss",
     "dice_loss",
+    "ContrastiveLoss",
+    "CosineSimilarityLoss",
+    "softmax_weighted_loss",
+    "softmax_loss",
 ]
 
 cross_entropy = F.cross_entropy
@@ -72,36 +76,75 @@ def MMD_loss(x, y, width=1):
 
 
 class ContrastiveLoss(nn.Module):
-    def __init__(self, batch_size=2, temperature=0.5):
+    """Contrastive loss with dynamic batch size B = features.shape[0] // 2 and negative mask (2B, 2B)."""
+
+    def __init__(self, batch_size=None, temperature=0.5):
         super().__init__()
         self.batch_size = batch_size
-        self.register_buffer("temperature", torch.tensor(temperature).cuda())
-        self.register_buffer(
-            "negatives_mask",
-            (~torch.eye(batch_size * 2, batch_size * 2, dtype=bool).cuda()).float(),
-        )
+        self.temperature = float(temperature)
 
-    def forward(self, emb_i, emb_j):
-        z_i = F.normalize(emb_i, dim=1)  # (bs, dim)  --->  (bs, dim)
-        z_j = F.normalize(emb_j, dim=1)  # (bs, dim)  --->  (bs, dim)
+    def forward(self, emb_i: torch.Tensor, emb_j: torch.Tensor | None = None) -> torch.Tensor:
+        if emb_j is None:
+            B = emb_i.shape[0] // 2
+            z_i = emb_i[:B]
+            z_j = emb_i[B:]
+        else:
+            B = emb_i.shape[0]
+            z_i = emb_i
+            z_j = emb_j
 
-        representations = torch.cat([z_i, z_j], dim=0)  # repre: (2*bs, dim)
+        z_i = F.normalize(z_i, dim=1)
+        z_j = F.normalize(z_j, dim=1)
+
+        representations = torch.cat([z_i, z_j], dim=0)  # (2*B, dim)
         similarity_matrix = F.cosine_similarity(
             representations.unsqueeze(1), representations.unsqueeze(0), dim=2
-        )  # simi_mat: (2*bs, 2*bs)
+        )  # (2*B, 2*B)
 
-        sim_ij = torch.diag(similarity_matrix, self.batch_size)  # bs
-        sim_ji = torch.diag(similarity_matrix, -self.batch_size)  # bs
-        positives = torch.cat([sim_ij, sim_ji], dim=0)  # 2*bs
+        sim_ij = torch.diag(similarity_matrix, B)
+        sim_ji = torch.diag(similarity_matrix, -B)
+        positives = torch.cat([sim_ij, sim_ji], dim=0)  # 2*B
 
-        nominator = torch.exp(positives / self.temperature)  # 2*bs
-        denominator = self.negatives_mask * torch.exp(
-            similarity_matrix / self.temperature
-        )  # 2*bs, 2*bs
+        negatives_mask = (~torch.eye(2 * B, 2 * B, dtype=torch.bool, device=emb_i.device)).float()
 
-        loss_partial = -torch.log(nominator / torch.sum(denominator, dim=1))  # 2*bs
-        loss = torch.sum(loss_partial) / (2 * self.batch_size)
+        nominator = torch.exp(positives / self.temperature)
+        denominator = negatives_mask * torch.exp(similarity_matrix / self.temperature)
+
+        loss_partial = -torch.log(nominator / (torch.sum(denominator, dim=1) + 1e-8) + 1e-8)
+        loss = torch.sum(loss_partial) / (2 * B)
         return loss
+
+
+class CosineSimilarityLoss(nn.Module):
+    """Cosine similarity loss for multimodal feature alignment across M=3 modalities."""
+
+    def __init__(self, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, features: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor) -> torch.Tensor:
+        if isinstance(features, torch.Tensor):
+            if features.ndim >= 3 and features.shape[1] == 3:
+                feats = [features[:, m, ...] for m in range(features.shape[1])]
+            else:
+                feats = [features]
+        else:
+            feats = list(features)
+
+        M = len(feats)
+        if M < 2:
+            return torch.tensor(0.0, device=feats[0].device, dtype=feats[0].dtype)
+
+        flat_feats = [f.flatten(1) for f in feats]
+        total_loss = 0.0
+        num_pairs = 0
+        for i in range(M):
+            for j in range(i + 1, M):
+                cos_sim = F.cosine_similarity(flat_feats[i], flat_feats[j], dim=1, eps=self.eps)
+                total_loss = total_loss + (1.0 - cos_sim.mean())
+                num_pairs += 1
+
+        return total_loss / max(num_pairs, 1)
 
 
 def Dice_loss(predictive, target, ep=1e-8):
@@ -111,67 +154,67 @@ def Dice_loss(predictive, target, ep=1e-8):
     return loss
 
 
-def dice_loss(output, target, num_cls=5, eps=1e-7):
-    target = target.float()
-    for i in range(num_cls):
-        num = torch.sum(output[:, i, :, :, :] * target[:, i, :, :, :])
-        l = torch.sum(output[:, i, :, :, :])
-        r = torch.sum(target[:, i, :, :, :])
-        if i == 0:
-            dice = 2.0 * num / (l + r + eps)
-        else:
-            dice += 2.0 * num / (l + r + eps)
-    return 1.0 - 1.0 * dice / num_cls
+def dice_loss(output, target, num_cls=4, eps=1e-7):
+    """Dice loss supporting both 2D (B, C, H, W) and 3D (B, C, H, W, Z), integer or one-hot targets."""
+    if target.ndim == output.ndim - 1:
+        target = F.one_hot(target.long(), num_classes=output.shape[1])
+        perm = (0, target.ndim - 1) + tuple(range(1, target.ndim - 1))
+        target = target.permute(perm).float()
+    else:
+        target = target.float()
+
+    C = output.shape[1]
+    dice = 0.0
+    for i in range(C):
+        num = torch.sum(output[:, i, ...] * target[:, i, ...])
+        l = torch.sum(output[:, i, ...])
+        r = torch.sum(target[:, i, ...])
+        dice += 2.0 * num / (l + r + eps)
+    return 1.0 - 1.0 * dice / C
 
 
-def softmax_weighted_loss(output, target, num_cls=5):
-    target = target.float()
-    B, _, H, W, Z = output.size()
-    for i in range(num_cls):
-        outputi = output[:, i, :, :, :]
-        targeti = target[:, i, :, :, :]
-        weighted = 1.0 - (
-            torch.sum(targeti, (1, 2, 3)) * 1.0 / torch.sum(target, (1, 2, 3, 4))
-        )
-        weighted = torch.reshape(weighted, (-1, 1, 1, 1)).repeat(1, H, W, Z)
-        if i == 0:
-            cross_loss = (
-                -1.0
-                * weighted
-                * targeti
-                * torch.log(torch.clamp(outputi, min=0.005, max=1)).float()
-            )
-        else:
-            cross_loss += (
-                -1.0
-                * weighted
-                * targeti
-                * torch.log(torch.clamp(outputi, min=0.005, max=1)).float()
-            )
-    cross_loss = torch.mean(cross_loss)
-    return cross_loss
+def softmax_weighted_loss(output, target, num_cls=4):
+    """Weighted cross-entropy loss supporting both 2D and 3D tensors."""
+    if target.ndim == output.ndim - 1:
+        target = F.one_hot(target.long(), num_classes=output.shape[1])
+        perm = (0, target.ndim - 1) + tuple(range(1, target.ndim - 1))
+        target = target.permute(perm).float()
+    else:
+        target = target.float()
+
+    C = output.shape[1]
+    total_axes = tuple(range(1, target.ndim))
+    total_target_sum = torch.sum(target, dim=total_axes, keepdim=True) + 1e-8
+
+    cross_loss = 0.0
+    for i in range(C):
+        outputi = output[:, i, ...]
+        targeti = target[:, i, ...]
+        class_sum = torch.sum(targeti, dim=tuple(range(1, targeti.ndim)), keepdim=True)
+        weighted = 1.0 - (class_sum / total_target_sum)
+        for _ in range(targeti.ndim - 1):
+            weighted = weighted.unsqueeze(-1)
+        cross_loss += -1.0 * weighted * targeti * torch.log(torch.clamp(outputi, min=0.005, max=1.0)).float()
+
+    return torch.mean(cross_loss)
 
 
-def softmax_loss(output, target, num_cls=5):
-    target = target.float()
-    _, _, H, W, Z = output.size()
-    for i in range(num_cls):
-        outputi = output[:, i, :, :, :]
-        targeti = target[:, i, :, :, :]
-        if i == 0:
-            cross_loss = (
-                -1.0
-                * targeti
-                * torch.log(torch.clamp(outputi, min=0.005, max=1)).float()
-            )
-        else:
-            cross_loss += (
-                -1.0
-                * targeti
-                * torch.log(torch.clamp(outputi, min=0.005, max=1)).float()
-            )
-    cross_loss = torch.mean(cross_loss)
-    return cross_loss
+def softmax_loss(output, target, num_cls=4):
+    """Standard cross-entropy loss on softmax probabilities."""
+    if target.ndim == output.ndim - 1:
+        target = F.one_hot(target.long(), num_classes=output.shape[1])
+        perm = (0, target.ndim - 1) + tuple(range(1, target.ndim - 1))
+        target = target.permute(perm).float()
+    else:
+        target = target.float()
+
+    C = output.shape[1]
+    cross_loss = 0.0
+    for i in range(C):
+        outputi = output[:, i, ...]
+        targeti = target[:, i, ...]
+        cross_loss += -1.0 * targeti * torch.log(torch.clamp(outputi, min=0.005, max=1.0)).float()
+    return torch.mean(cross_loss)
 
 
 def FocalLoss(output, target, alpha=0.25, gamma=2.0):

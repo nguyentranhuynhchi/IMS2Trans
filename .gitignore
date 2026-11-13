@@ -130,3 +130,11 @@ dmypy.json
 
 .tmp
 .DS_Store
+
+# Benchmark artifacts & checkpoints
+runs/
+outputs/
+test_predictions/
+*.pt
+*.tmp
+*.log

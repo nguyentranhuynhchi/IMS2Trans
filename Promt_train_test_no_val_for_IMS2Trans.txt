@@ -1,0 +1,204 @@
+PROMPT CHUẨN HÓA BASELINE IMS2Trans ĐỂ ĐỐI CHỨNG VỚI SCAR HIỆN TẠI
+Áp dụng: MyoPS380 — 304 train / 76 test — 300 epochs — không validation
+MyoPS++ chỉ nhắc để dự phòng tương lai: train/test không validation; chưa chốt protocol, chưa triển khai
+Đối chiếu SCAR local ngày 06/11/2026 và IMS2Trans gốc
+
+Bạn là chuyên gia kỹ thuật và nghiên cứu AI về phân đoạn hình ảnh y tế.
+Tôi có mã nguồn baseline IMS2Trans (Information-preserving Multimodal Swin Transformer). Hãy chuẩn hóa và thích nghi repo baseline IMS2Trans để huấn luyện, resume và đánh giá CHỈ TRÊN MYOPS380, đối chứng trực tiếp với SCAR M2-Plus và TransUNet theo đúng quy định dưới đây. MyoPS++ chỉ được nhắc để giữ đường mở rộng sau này, không thuộc phạm vi thực hiện hiện tại.
+
+- Repo baseline cần chỉnh: D:/NCKH/ChanhThucNhatCoThe/IMS2Trans (Remote: https://github.com/nguyentranhuynhchi/IMS2Trans.git)
+- SCAR tham chiếu (READ-ONLY, CẤM SỬA): D:/NCKH/ChanhThucNhatCoThe/SCAR
+- Data root MyoPS380: /content/MyoPS380_dataset/Processed_data (hoặc biến môi trường MYOPS380_DATA_ROOT)
+- Manifest đã khóa: D:/NCKH/ChanhThucNhatCoThe/IMS2Trans/splits/myops380_no_val/ (đồng bộ tuyệt đối từ SCAR)
+- Dataset profile đang chọn: myops380; training_protocol_id=myops380_train304_test76_last_v1
+- Danh sách 5 seed chuẩn: [1234, 1098, 1024, 2026, 6868] và báo cáo độc lập từng seed.
+
+CHẾ ĐỘ LÀM VIỆC:
+- AUDIT_ONLY: Đã hoàn tất đọc source, kiểm toán kiến trúc, ma trận tương thích và đối chiếu quy chuẩn.
+- IMPLEMENT_BASELINE: Đã thực thi trọn vẹn bên trong repo IMS2Trans. Tuyệt đối không can thiệp vào SCAR tham chiếu, không sửa dataset nguồn hay thay đổi manifest đã khóa. Đã kiểm thử smoke test, nghiệm thu theo SCAR benchmark validator và push lên GitHub.
+
+MỤC TIÊU VÀ NGUỒN THAM CHIẾU:
+Benchmark kiểm soát chặt chẽ: Dữ liệu/split, augmentation, ngân sách epoch/batch, optimizer/LR/scheduler, policy precision, checkpoint cuối và Shared Evaluator.
+Giữ nguyên kiến trúc cốt lõi, objective/loss gốc của IMS2Trans: CE + Dice + lambda_con * Contrastive + lambda_cos * Cosine Similarity. Không tùy tiện đổi sang loss của SCAR và không tuyên bố mọi thành phần training giống hệt SCAR.
+
+================================================================================
+0. PHẠM VI HIỆN TẠI VÀ KHẢ NĂNG MỞ RỘNG VỀ SAU
+================================================================================
+
+HIỆN TẠI CHỈ THỰC HIỆN MYOPS380 theo protocol 304 train / 76 test, không validation, 300 epochs. Tuyệt đối không audit hay chạy MyoPS++ lúc này.
+
+MyoPS++ chỉ là định hướng tương lai:
+- Khi nào được yêu cầu MyoPS++, cũng chỉ dùng TRAIN và TEST, KHÔNG có validation, dùng checkpoint cuối ngân sách.
+- Hiện CHƯA chốt cohort, manifest, spacing mm hay protocol ID cho MyoPS++; không tự ý lấy profile có validation của SCAR gán vào IMS2Trans lúc này.
+
+Nguyên tắc tách biệt kiến trúc (Model Contract vs Dataset Adapter):
+- IMS2Trans là mạng Swin Transformer 2D đa luồng: Trích xuất đặc trưng từng chuỗi xung CMR qua Swin Transformer 2D với window_size=(8,8), kết hợp cơ chế chú ý intra-modal và inter-modal token fusion ở bottleneck (Stage 5), giải mã qua 5 tầng Region Fusion Modules (RFM1..RFM5) trích xuất 4 logits canonical.
+- Input nhận tensor 3 kênh ghép (bSSFP, LGE, T2w) kích thước 128x128.
+- Giữ nguyên kiến trúc này, mọi biến đổi về dữ liệu và chuẩn nhãn được cô lập hoàn toàn tại Dataset Adapter và Output Adapter ở hai đầu ranh giới.
+
+================================================================================
+1. KHÓA DỮ LIỆU VÀ PHẠM VI NO-VAL MYOPS380 CHO IMS2TRANS
+================================================================================
+
+- Training protocol: myops380_train304_test76_last_v1.
+- Dùng đúng train.txt (304 bệnh nhân, 1.972 lát cắt) và test_vol.txt (76 bệnh nhân test chính thức). Giữ nguyên ID và thứ tự, không chia lại theo seed.
+- Tuyệt đối không dùng val.txt/val_vol.txt, không tạo validation loader, không chạy validation giữa các epoch, không early stopping theo test/val.
+- Ba modality bSSFP, LGE, T2w đã căn chỉnh: Input đưa vào IMS2Trans theo dạng 3 kênh ghép [bSSFP, LGE, T2w] tạo thành tensor shape (B, 3, 128, 128).
+- Không nhân bản kênh, không dùng zero-fill, không thay đổi thứ tự 3 kênh.
+- Dữ liệu MyoPS380 cache trên đĩa đã ở thang [0, 1]: Nạp trực tiếp, cấm chia 255 lần nữa, cấm z-score, cấm histogram matching.
+- Kích thước không gian: Cố định 128x128. Swin Transformer 2D với window_size=(8,8) chia lưới chẵn trên các độ phân giải 128 -> 64 -> 32 -> 16 -> 8 mà không cần padding biên.
+
+================================================================================
+2. QUY TẮC NHÃN GIẢI PHẪU VÀ HỆ THỐNG ADAPTER CHO IMS2TRANS
+================================================================================
+
+Bảng đối chiếu chuẩn nhãn:
+                 Legacy (Dữ liệu đĩa MyoPS380)    Canonical (SCAR & Evaluator)
+ID 0             Background                      Background
+ID 1             Normal myocardium               Normal myocardium
+ID 2             Scar                            Edema-exclusive
+ID 3             Edema-exclusive                 Scar
+Edema-inclusive  {2,3}                           {2,3}
+Whole myocardium {1,2,3}                         {1,2,3}
+
+Quy chuẩn Adapter bắt buộc cho IMS2Trans:
+- source_label_order: legacy
+- source_to_internal: Đổi 2 <-> 3 ngay tại Dataset Adapter bằng hàm canonicalize_label() với LUT [0, 1, 3, 2] trên RAM khi nạp ảnh.
+- internal_label_order: canonical (Mô hình IMS2Trans học trực tiếp: kênh 2 là Edema, kênh 3 là Scar).
+- native_output_label_order: canonical (Đầu ra argmax của IMS2Trans tự nhiên là Canonical).
+- native_to_export: identity (Giữ nguyên, TUYỆT ĐỐI KHÔNG SWAP LẦN NỮA để tránh lỗi double swap).
+- exported_label_order: canonical (Xuất file test_predictions/*.npz có nhãn 3 là Scar).
+
+================================================================================
+3. KHÓA DATA AUGMENTATION CHUẨN SCAR / I-MMSEG
+================================================================================
+
+Bắt buộc tích hợp 100% logic RandomGenerator trong training/dataset/myops_dataset.py của SCAR vào IMS2Trans:
+1) Chuỗi if/elif/elif đồng bộ 3 modality và mask (mỗi nhánh lấy 1 random.random() độc lập):
+   - Nhánh 1 (50%): k=np.random.randint(0,4), xoay k*90 độ, lật axis=np.random.randint(0,2).
+   - Nhánh 2 (25%): angle=np.random.randint(-20,20), xoay góc nguyên bằng ndimage.rotate(order=0, reshape=False).
+   - Nhánh 3 (12.5%): Gaussian noise mean=0, std=0.2, dùng chung 1 noise map cho cả 3 ảnh, clip [0, 1], mask giữ nguyên.
+   - Nhánh 4 (12.5%): Giữ nguyên, không làm gì.
+2) Xác suất 50%: Dịch nguyên random.randint(-5,5), np.roll theo axis=(0,1) có vòng qua biên.
+3) Xác suất 50%: Brightness factor random.uniform(0.8,1.2) dùng chung 3 modality, np.clip(image*factor, 0, 255).
+4) Xác suất 50%: Gamma random.uniform(0.8,1.2) dùng chung 3 modality, np.power(image/255.0, gamma)*255.0.
+5) Xác suất 50%: Random crop top/left ngẫu nhiên trong khoảng H//5, W//5, crop tối đa (128,128).
+6) Nếu kích thước khác (128,128): ndimage.zoom order=3 cho ảnh, order=0 cho nhãn.
+7) Ảnh chuyển thành float32 tensor (3,H,W); mask chuyển thành long tensor (H,W).
+
+================================================================================
+4. KHÓA NGÂN SÁCH VÀ RECIPE HUẤN LUYỆN
+================================================================================
+
+- Tổng số epoch: Đúng 300 epochs.
+- Batch size: Tổng batch vật lý bằng 16 trên toàn bộ GPU, accum_steps=1, drop_last=False.
+- Mỗi epoch có 124 batches (batch cuối cùng chứa 4 mẫu). Tổng số lần cập nhật optimizer: đúng 37.200 updates.
+- Optimizer: AdamW áp dụng trên các tham số Trainable (~1.52M tham số):
+  - base_lr = 0.0003333 (theo chuẩn benchmark SCAR đã khóa)
+  - weight_decay = 0.0001
+  - betas = (0.9, 0.999), eps = 1e-8
+  - clip_grad = 0.0 (tắt gradient clipping)
+- Scheduler: Polynomial decay mũ 0.9 cập nhật SAU mỗi bước optimizer thành công với offset iteration zero-based (chuẩn im_mseg_adamw_poly_v1):
+  lr_u = base_lr * max(0, 1 - max(0, u - 1) / 37200) ** 0.9
+  (2 update đầu giữ base_lr; update cuối cùng u=37200 có lr > 0).
+- Precision: amp=auto (Ưu tiên BF16 trên RTX 3090/4090/A100; tự động FP16 với GradScaler trên GPU cũ).
+- Số luồng: num_workers = 4, pin_memory = True, seed = 1234, cudnn.deterministic = True.
+
+================================================================================
+5. GIỮ OBJECTIVE VÀ ĐẶC THÙ BASELINE IMS2TRANS
+================================================================================
+
+- Objective loss bảo toàn 100% công thức gốc của IMS2Trans:
+  Loss_total = Loss_fuse (CE + Dice) + lambda_con * Loss_contrastive + lambda_cos * Loss_cosine + lambda_prm * Loss_deep_supervision
+- Đã khắc phục triệt để lỗi runtime bug của ContrastiveLoss gốc: Tự động tính batch size B động và negative mask (2B, 2B) thay vì hardcode batch_size=2 và mask (4, 4).
+- Đã tích hợp CosineSimilarityLoss cấu hình động cho 3 cặp modality (bSSFP-LGE, bSSFP-T2, LGE-T2).
+
+================================================================================
+6. TÊN TRỌNG SỐ, CHECKPOINT VÀ RESUME
+================================================================================
+
+- Tên model_id chuẩn: ims2trans
+- Tên checkpoint chuẩn duy nhất: ims2trans_seed<seed>.pt (ví dụ: ims2trans_seed1234.pt).
+- Đường dẫn lưu trữ: <run_dir>/checkpoints/ims2trans_seed1234.pt.
+- Cơ chế lưu: Lưu atomic (ghi đè an toàn qua file tạm .tmp) sau mỗi epoch hoàn thành để phục vụ recovery.
+- Checkpoint cuối epoch 300: planned_epochs=300, completed_epochs=300, training_complete=True, training_protocol.id=myops380_train304_test76_last_v1.
+- Tuyệt đối KHÔNG tạo best.pt hay last.pt cho run mới.
+- Checkpoint lưu đầy đủ: model, optimizer, scheduler, scaler, RNG states, global_step, total_updates, epoch_times.
+- Hỗ trợ cờ --resume để khôi phục chính xác trạng thái huấn luyện khi bị đứt kết nối mạng trên Colab CLI/SSH.
+
+================================================================================
+7. INFERENCE VÀ XUẤT PREDICTION CỦA IMS2TRANS
+================================================================================
+
+- Chỉ chạy inference khi checkpoint ims2trans_seed<seed>.pt đã hoàn thành trọn vẹn 300 epochs.
+- Thực thi: model.eval(), torch.no_grad(), single pass forward per batch.
+- Nghiêm cấm: Cấm TTA (Test-Time Augmentation), cấm lọc thành phần liên thông (LCC), cấm hậu xử lý hình thái học.
+- Xử lý mảng: Dự đoán từng lát cắt 2D, ghép lại thành volume 3D HWD (128, 128, D) đúng thứ tự lát cắt của từng ca test.
+- Xuất 76 file dự đoán tại: <run_dir>/test_predictions/<CaseID>_pred.npz (ví dụ case0001_pred.npz).
+  - Key mảng: 'prediction'
+  - Kiểu mảng: uint8
+  - Nhãn: Bắt buộc là CANONICAL (0: Nền, 1: Cơ tim, 2: Phù nề, 3: Sẹo).
+  - Tích hợp thêm các khóa tự mô tả: exported_label_order="canonical", adapter_version="canonical_v1".
+
+================================================================================
+8. SHARED EVALUATOR VÀ BÁO CÁO NGHIỆM THU
+================================================================================
+
+Tích hợp evaluator độc lập (evaluate_myops.py) tái sử dụng trực tiếp module tính toán khoảng cách bề mặt từ SCAR:
+- Đọc GT cache và đảm bảo GT ở chuẩn Canonical.
+- Gọi trực tiếp dataset_rows() và summarize_dataset_rows() từ surface_distance.py:
+  - Protocol ID: myops380_voxel_v3
+  - Đơn vị đo: voxel
+  - Empty mask policy: Cả pred và GT rỗng -> undefined; 1 bên rỗng -> Dice=0, khoảng cách undefined.
+  - Vùng giải phẫu: normal_myocardium={1}, edema={2}, scar={3}, edema_inclusive={2,3}, myocardial_ring={1,2,3}.
+  - Điểm tổng kết: avg_pathology_dice và avg_pathology_inclusive_dice.
+- Xuất đúng 2 file báo cáo chuẩn mực tại thư mục kết quả:
+  1) per_case.csv: Chi tiết từng ca bệnh nhân trên toàn bộ các chỉ số Dice, IoU, HD95, ASD, Precision, Recall.
+  2) metrics.json: File tổng kết trung bình toàn tập test (chứa mã băm checkpoint_sha256).
+
+================================================================================
+9. BỘ LỆNH THỰC THI HUẤN LUYỆN TRÊN MÁY CHỦ COLAB CLI / A100
+================================================================================
+
+1. Khởi tạo môi trường (Chạy 1 lần duy nhất tại thư mục /content):
+   cd /content && git clone https://github.com/nguyentranhuynhchi/IMS2Trans.git /content/IMS2Trans
+   cd /content/IMS2Trans && bash environment_ims2trans.sh
+
+2. Phân bổ Session tmux:
+   - Session `s3`: Huấn luyện 4 Seed song song (1098, 1024, 2026, 6868) với AMP và đa luồng:
+     tmux new -s s3
+   - Session `s4`: Chạy độc lập Seed 1234 đo chuẩn hiệu suất (FP32, num_workers=0, pin_memory=True):
+     tmux new -s s4
+
+Chi tiết các lệnh chạy từng terminal:
+
+[SESSION s4 - TERMINAL 1 (Seed 1234 - Độc lập đo hiệu suất A100)]:
+cd /content/IMS2Trans && export OMP_NUM_THREADS=2
+python3 train_myops.py --data_root /content/MyoPS380_dataset/Processed_data --list_dir splits/myops380_no_val --output_dir /content/drive/MyDrive/MyoPS_Results/IMS2Trans/runs/ims2trans_seed1234 --seed 1234 --batch_size 16 --lr 0.0003333 --max_epochs 300 --amp none --num_workers 0 --pin_memory --measure_efficiency --efficiency_output outputs/runs/ims2trans/efficiency_metrics.json && \
+python3 evaluate_myops.py --checkpoint /content/drive/MyDrive/MyoPS_Results/IMS2Trans/runs/ims2trans_seed1234/checkpoints/ims2trans_seed1234.pt --data_root /content/MyoPS380_dataset/Processed_data --list_dir splits/myops380_no_val --output_dir /content/drive/MyDrive/MyoPS_Results/IMS2Trans/runs/ims2trans_seed1234/evaluation --amp none
+
+[SESSION s3 - TERMINAL 2 (Seed 1098)]:
+cd /content/IMS2Trans && export OMP_NUM_THREADS=2
+python3 train_myops.py --data_root /content/MyoPS380_dataset/Processed_data --list_dir splits/myops380_no_val --output_dir /content/drive/MyDrive/MyoPS_Results/IMS2Trans/runs/ims2trans_seed1098 --seed 1098 --batch_size 16 --lr 0.0003333 --max_epochs 300 --amp auto --num_workers 4 --pin_memory && \
+python3 evaluate_myops.py --checkpoint /content/drive/MyDrive/MyoPS_Results/IMS2Trans/runs/ims2trans_seed1098/checkpoints/ims2trans_seed1098.pt --data_root /content/MyoPS380_dataset/Processed_data --list_dir splits/myops380_no_val --output_dir /content/drive/MyDrive/MyoPS_Results/IMS2Trans/runs/ims2trans_seed1098/evaluation
+
+[SESSION s3 - TERMINAL 3 (Seed 1024)]:
+cd /content/IMS2Trans && export OMP_NUM_THREADS=2
+python3 train_myops.py --data_root /content/MyoPS380_dataset/Processed_data --list_dir splits/myops380_no_val --output_dir /content/drive/MyDrive/MyoPS_Results/IMS2Trans/runs/ims2trans_seed1024 --seed 1024 --batch_size 16 --lr 0.0003333 --max_epochs 300 --amp auto --num_workers 4 --pin_memory && \
+python3 evaluate_myops.py --checkpoint /content/drive/MyDrive/MyoPS_Results/IMS2Trans/runs/ims2trans_seed1024/checkpoints/ims2trans_seed1024.pt --data_root /content/MyoPS380_dataset/Processed_data --list_dir splits/myops380_no_val --output_dir /content/drive/MyDrive/MyoPS_Results/IMS2Trans/runs/ims2trans_seed1024/evaluation
+
+[SESSION s3 - TERMINAL 4 (Seed 2026)]:
+cd /content/IMS2Trans && export OMP_NUM_THREADS=2
+python3 train_myops.py --data_root /content/MyoPS380_dataset/Processed_data --list_dir splits/myops380_no_val --output_dir /content/drive/MyDrive/MyoPS_Results/IMS2Trans/runs/ims2trans_seed2026 --seed 2026 --batch_size 16 --lr 0.0003333 --max_epochs 300 --amp auto --num_workers 4 --pin_memory && \
+python3 evaluate_myops.py --checkpoint /content/drive/MyDrive/MyoPS_Results/IMS2Trans/runs/ims2trans_seed2026/checkpoints/ims2trans_seed2026.pt --data_root /content/MyoPS380_dataset/Processed_data --list_dir splits/myops380_no_val --output_dir /content/drive/MyDrive/MyoPS_Results/IMS2Trans/runs/ims2trans_seed2026/evaluation
+
+[SESSION s3 - TERMINAL 5 (Seed 6868)]:
+cd /content/IMS2Trans && export OMP_NUM_THREADS=2
+python3 train_myops.py --data_root /content/MyoPS380_dataset/Processed_data --list_dir splits/myops380_no_val --output_dir /content/drive/MyDrive/MyoPS_Results/IMS2Trans/runs/ims2trans_seed6868 --seed 6868 --batch_size 16 --lr 0.0003333 --max_epochs 300 --amp auto --num_workers 4 --pin_memory && \
+python3 evaluate_myops.py --checkpoint /content/drive/MyDrive/MyoPS_Results/IMS2Trans/runs/ims2trans_seed6868/checkpoints/ims2trans_seed6868.pt --data_root /content/MyoPS380_dataset/Processed_data --list_dir splits/myops380_no_val --output_dir /content/drive/MyDrive/MyoPS_Results/IMS2Trans/runs/ims2trans_seed6868/evaluation
+
+3. Lệnh Resume khi bị ngắt kết nối (Áp dụng cho bất kỳ seed nào):
+   python3 train_myops.py --resume /content/drive/MyDrive/MyoPS_Results/IMS2Trans/runs/ims2trans_seed1234/checkpoints/ims2trans_seed1234.pt
+
+4. Nén kết quả 5 seed thành 1 file duy nhất để tải về máy:
+   cd /content/drive/MyDrive/MyoPS_Results/IMS2Trans && tar -czf all_ims2trans_5seeds.tar.gz runs
