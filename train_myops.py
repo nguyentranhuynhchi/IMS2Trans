@@ -80,8 +80,11 @@ def build_parser():
     parser.add_argument("--data_root", "--data-root",
                         default=os.environ.get("MYOPS380_DATA_ROOT", "/content/MyoPS380_dataset/Processed_data"),
                         help="Root folder containing bSSFP, LGE, T2w subdirectories")
-    parser.add_argument("--list_dir", "--list-dir", default=str(PROJECT_ROOT / "splits" / "myops380_no_val"),
-                        help="Directory containing train.txt and test_vol.txt")
+    parser.add_argument("--dataset", "--dataset_id", "--dataset-id", default="myops380",
+                        choices=["myops380", "myopspp"],
+                        help="Benchmark dataset to train on")
+    parser.add_argument("--list_dir", "--list-dir", "--split_dir", "--split-dir", default=None,
+                        help="Directory containing train.txt and test_vol.txt (defaults dynamically by dataset)")
     parser.add_argument("--output_dir", "--output-dir", "--run_dir", "--run-dir", default=None,
                         help="Run output directory; defaults to runs/ims2trans_seed<seed>")
     parser.add_argument("--run_root", "--run-root", default=None,
@@ -89,7 +92,6 @@ def build_parser():
     parser.add_argument("--run_name", "--run-name", default=None,
                         help="Optional run folder name under --run_root (default: ims2trans_seed<seed>)")
     parser.add_argument("--model_id", default="ims2trans", help="Canonical lowercase model ID")
-    parser.add_argument("--dataset_id", "--dataset-id", default="myops380", help="Dataset identifier")
     parser.add_argument("--img_size", "--img-size", type=int, default=128, help="Model input spatial size (128x128)")
     parser.add_argument("--num_classes", "--num-classes", type=int, default=4, help="Number of canonical classes (4)")
     parser.add_argument("--max_epochs", "--epochs", type=int, default=300, help="Planned training epochs (300)")
@@ -119,6 +121,7 @@ def build_parser():
                         action=argparse.BooleanOptionalAction, default=True,
                         help="Measure Complexity, Inference, and Training efficiency metrics and export JSON")
     parser.add_argument("--no_measure_efficiency", dest="measure_efficiency", action="store_false", help=argparse.SUPPRESS)
+
     parser.add_argument("--efficiency_output", "--efficiency-output", dest="efficiency_output",
                         default="outputs/runs/ims2trans/efficiency_metrics.json",
                         help="Primary JSON output path for efficiency metrics")
@@ -495,22 +498,42 @@ def _run_training(
             logging.info("=== Efficiency-only benchmark finished successfully ===")
             return
 
+    from datasets.dataset_myops import normalize_dataset_name, resolve_default_list_dir
+    norm_dataset = normalize_dataset_name(getattr(args, "dataset", getattr(args, "dataset_id", "myops380")))
+    args.dataset = norm_dataset
+    args.dataset_id = norm_dataset
+
     # Dataset & DataLoader
-    # Check both splits and lists
-    actual_list_dir = Path(args.list_dir)
-    if not (actual_list_dir / "train.txt").exists():
-        fallback_list_dir = PROJECT_ROOT / "lists" / "myops380_no_val"
-        if (fallback_list_dir / "train.txt").exists():
-            actual_list_dir = fallback_list_dir
+    if args.list_dir is not None:
+        actual_list_dir = Path(args.list_dir)
+        if not (actual_list_dir / "train.txt").exists():
+            for cand in [
+                PROJECT_ROOT / "splits" / f"{norm_dataset}_no_val",
+                PROJECT_ROOT / "lists" / f"{norm_dataset}_no_val",
+            ]:
+                if (cand / "train.txt").exists():
+                    actual_list_dir = cand
+                    break
+    else:
+        for cand in [
+            PROJECT_ROOT / "splits" / f"{norm_dataset}_no_val",
+            PROJECT_ROOT / "lists" / f"{norm_dataset}_no_val",
+        ]:
+            if (cand / "train.txt").exists():
+                actual_list_dir = cand
+                break
+        else:
+            actual_list_dir = resolve_default_list_dir(norm_dataset)
 
     train_dataset = MyopsDataset(
         base_dir=args.data_root,
         list_dir=str(actual_list_dir),
         split="train",
         transform=RandomGenerator(output_size=[args.img_size, args.img_size]),
-        label_order="legacy",
+        dataset=norm_dataset,
     )
     logging.info(f"Loaded train dataset: {len(train_dataset)} slices from {actual_list_dir}")
+
 
     g = torch.Generator()
     g.manual_seed(args.seed)

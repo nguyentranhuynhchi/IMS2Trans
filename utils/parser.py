@@ -145,3 +145,36 @@ class Parser(AttrDict):
         self.save_cfg(fname)
 
         return checkpoint_dir
+
+
+def add_common_dataset_args(parser):
+    """Add standardized dataset and split CLI arguments across entrypoints."""
+    import argparse
+    parser.add_argument(
+        "--dataset", "--dataset_id", "--dataset-id",
+        dest="dataset",
+        choices=["myops380", "myopspp"],
+        default="myops380",
+        help="Benchmark dataset to run (myops380 or myopspp)",
+    )
+    parser.add_argument(
+        "--list_dir", "--list-dir", "--split_dir", "--split-dir",
+        dest="list_dir",
+        default=None,
+        help="Directory containing dataset split lists (defaults dynamically by dataset)",
+    )
+    parser.add_argument(
+        "--measure_efficiency", "--measure-efficiency",
+        dest="measure_efficiency",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Measure Complexity and Inference efficiency metrics",
+    )
+    parser.add_argument(
+        "--no_measure_efficiency",
+        dest="measure_efficiency",
+        action="store_false",
+        help="Disable efficiency measurement",
+    )
+    return parser
+

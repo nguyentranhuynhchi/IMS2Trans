@@ -28,10 +28,13 @@ if str(PROJECT_ROOT) not in sys.path:
 from datasets.dataset_myops import (
     MyopsDataset,
     canonicalize_label,
+    normalize_dataset_name,
+    resolve_default_list_dir,
     CLASS_NAMES,
 )
 from models.ims2trans_2d import IMS2Trans2D
 from utils.metrics import (
+    BENCHMARK_PROTOCOLS,
     BENCHMARK_PROTOCOL,
     dataset_rows,
     summarize_dataset_rows,
@@ -44,17 +47,22 @@ def build_parser():
     parser.add_argument("--data_root", "--data-root",
                         default=os.environ.get("MYOPS380_DATA_ROOT", "/content/MyoPS380_dataset/Processed_data"),
                         help="Root folder containing bSSFP, LGE, T2w subdirectories")
-    parser.add_argument("--list_dir", "--list-dir", default=str(PROJECT_ROOT / "splits" / "myops380_no_val"),
-                        help="Directory containing test_vol.txt")
+    parser.add_argument("--dataset", "--dataset_id", "--dataset-id", default="myops380",
+                        choices=["myops380", "myopspp"],
+                        help="Benchmark dataset to evaluate")
+    parser.add_argument("--list_dir", "--list-dir", "--split_dir", "--split-dir", default=None,
+                        help="Directory containing test_vol.txt (defaults dynamically by dataset)")
     parser.add_argument("--output_dir", "--output-dir", default=None,
                         help="Evaluation output directory; defaults to checkpoint run directory / evaluation")
     parser.add_argument("--split", default="test_vol", help="Split name to evaluate (default: test_vol)")
-    parser.add_argument("--dataset_id", "--dataset-id", default="myops380", help="Dataset identifier")
     parser.add_argument("--batch_size", "--batch-size", type=int, default=8, help="Inference slices per batch")
     parser.add_argument("--device", default="auto", help="Device (auto, cuda, cpu)")
     parser.add_argument("--amp", choices=["auto", "none", "fp16", "bf16"], default="auto", help="AMP mode")
     parser.add_argument("--save_predictions", action=argparse.BooleanOptionalAction, default=True,
                         help="Save <CaseID>_pred.npz files")
+    parser.add_argument("--measure_efficiency", "--measure-efficiency", action=argparse.BooleanOptionalAction,
+                        default=True, help="Measure Complexity and Inference efficiency metrics")
+    parser.add_argument("--no_measure_efficiency", dest="measure_efficiency", action="store_false", help=argparse.SUPPRESS)
     parser.add_argument("--img_size", type=int, default=128, help="Model image size")
     parser.add_argument("--num_classes", type=int, default=4, help="Number of canonical classes")
     return parser
@@ -191,20 +199,40 @@ def main(argv=None):
     model.to(device)
     model.eval()
 
+    norm_dataset = normalize_dataset_name(getattr(args, "dataset", getattr(args, "dataset_id", "myops380")))
+    args.dataset = norm_dataset
+    args.dataset_id = norm_dataset
+
     # Load test dataset
-    actual_list_dir = Path(args.list_dir)
-    if not (actual_list_dir / f"{args.split}.txt").exists():
-        fallback = PROJECT_ROOT / "lists" / "myops380_no_val"
-        if (fallback / f"{args.split}.txt").exists():
-            actual_list_dir = fallback
+    if args.list_dir is not None:
+        actual_list_dir = Path(args.list_dir)
+        if not (actual_list_dir / f"{args.split}.txt").exists():
+            for cand in [
+                PROJECT_ROOT / "splits" / f"{norm_dataset}_no_val",
+                PROJECT_ROOT / "lists" / f"{norm_dataset}_no_val",
+            ]:
+                if (cand / f"{args.split}.txt").exists():
+                    actual_list_dir = cand
+                    break
+    else:
+        for cand in [
+            PROJECT_ROOT / "splits" / f"{norm_dataset}_no_val",
+            PROJECT_ROOT / "lists" / f"{norm_dataset}_no_val",
+        ]:
+            if (cand / f"{args.split}.txt").exists():
+                actual_list_dir = cand
+                break
+        else:
+            actual_list_dir = resolve_default_list_dir(norm_dataset)
 
     test_dataset = MyopsDataset(
         base_dir=args.data_root,
         list_dir=str(actual_list_dir),
         split=args.split,
-        label_order="legacy",
+        dataset=norm_dataset,
     )
     logging.info(f"Test cases to evaluate: {len(test_dataset)} from {actual_list_dir}/{args.split}.txt")
+
 
     all_rows = []
     start_eval_time = time.time()
@@ -240,8 +268,17 @@ def main(argv=None):
 
         # Compute benchmark metric rows
         if gt is not None:
-            case_rows = dataset_rows(prediction=pred, target=gt, case=case_name, compute_distance=True)
+            spacing = case_data.get("spacing")
+            case_rows = dataset_rows(
+                prediction=pred,
+                target=gt,
+                case=case_name,
+                compute_distance=True,
+                dataset_id=norm_dataset,
+                spacing=spacing,
+            )
             all_rows.extend(case_rows)
+
 
             dice_scar = next((r["dice"] for r in case_rows if r["region"] == "scar"), None)
             dice_edema = next((r["dice"] for r in case_rows if r["region"] == "edema"), None)
@@ -262,7 +299,7 @@ def main(argv=None):
 
     # Aggregate metrics
     if all_rows:
-        summary = summarize_dataset_rows(all_rows)
+        summary = summarize_dataset_rows(all_rows, dataset_id=norm_dataset)
 
         # Export per_case.csv
         per_case_file = output_dir / "per_case.csv"
@@ -274,8 +311,10 @@ def main(argv=None):
         logging.info(f"Saved per-case metrics to: {per_case_file}")
 
         # Assemble metrics.json
+        dist_unit = "mm" if norm_dataset == "myopspp" else "voxel"
         metrics_payload = {
-            "dataset": args.dataset_id,
+            "dataset": args.dataset,
+            "dataset_id": norm_dataset,
             "split": args.split,
             "checkpoint": str(checkpoint_path),
             "checkpoint_sha256": ckpt_sha256,
@@ -283,11 +322,16 @@ def main(argv=None):
             "planned_epochs": planned_epochs,
             "training_complete": training_complete,
             "model_id": "ims2trans",
-            "benchmark_protocol": BENCHMARK_PROTOCOL,
+            "distance_unit": dist_unit,
+            "benchmark_protocol": BENCHMARK_PROTOCOLS.get(norm_dataset, BENCHMARK_PROTOCOL),
             "training_protocol": training_protocol,
             "summary": summary,
             "evaluation_duration_seconds": round(eval_duration, 2),
         }
+        # Backward compatibility aliases at root
+        for region in ("scar", "edema", "normal_myocardium", "edema_inclusive", "myocardial_ring"):
+            if region in summary:
+                metrics_payload[region] = summary[region]
 
         metrics_file = output_dir / "metrics.json"
         with open(metrics_file, "w", encoding="utf-8") as f:
@@ -296,18 +340,21 @@ def main(argv=None):
 
         # Summary Log
         logging.info("=" * 60)
-        logging.info("MYOPS380 BENCHMARK SUMMARY RESULTS (IMS2Trans)")
+        logging.info(f"{norm_dataset.upper()} BENCHMARK SUMMARY RESULTS (IMS2Trans)")
         logging.info(f"  Scar Dice:                     {summary['scar']['mean_dice']:.4f}")
         logging.info(f"  Edema Dice (Exclusive):        {summary['edema']['mean_dice']:.4f}")
         logging.info(f"  Edema-Inclusive Dice:          {summary['edema_inclusive']['mean_dice']:.4f}")
         logging.info(f"  Normal Myocardium Dice:        {summary['normal_myocardium']['mean_dice']:.4f}")
         logging.info(f"  Avg Pathology Dice:            {summary['avg_pathology_dice']:.4f}")
         logging.info(f"  Avg Pathology Inclusive Dice:  {summary['avg_pathology_inclusive_dice']:.4f}")
-        if summary['scar']['mean_hd95_voxel'] is not None:
-            logging.info(f"  Scar HD95 (voxel):             {summary['scar']['mean_hd95_voxel']:.2f}")
-        if summary['edema']['mean_hd95_voxel'] is not None:
-            logging.info(f"  Edema HD95 (voxel):            {summary['edema']['mean_hd95_voxel']:.2f}")
+        hd_scar = summary['scar'].get(f'mean_hd95_{dist_unit}')
+        if hd_scar is not None:
+            logging.info(f"  Scar HD95 ({dist_unit}):             {hd_scar:.2f}")
+        hd_edema = summary['edema'].get(f'mean_hd95_{dist_unit}')
+        if hd_edema is not None:
+            logging.info(f"  Edema HD95 ({dist_unit}):            {hd_edema:.2f}")
         logging.info("=" * 60)
+
 
 
 if __name__ == "__main__":

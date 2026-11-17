@@ -285,3 +285,45 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+
+
+# ---------------------------------------------------------------------------
+# CLI Parity and Multi-Dataset Support for IMS2Trans Inference
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    import argparse
+    parser = argparse.ArgumentParser(description="IMS2Trans prediction and volume inference", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--checkpoint", default=None, help="Path to ims2trans_seed<seed>.pt checkpoint")
+    parser.add_argument("--data_root", "--data-root",
+                        default=os.environ.get("MYOPS380_DATA_ROOT", "/content/MyoPS380_dataset/Processed_data"),
+                        help="Root folder containing bSSFP, LGE, T2w subdirectories")
+    parser.add_argument("--dataset", "--dataset_id", "--dataset-id", default="myops380",
+                        choices=["myops380", "myopspp"],
+                        help="Benchmark dataset to predict")
+    parser.add_argument("--list_dir", "--list-dir", "--split_dir", "--split-dir", default=None,
+                        help="Directory containing test_vol.txt (defaults dynamically by dataset)")
+    parser.add_argument("--output_dir", "--output-dir", default=None,
+                        help="Inference output directory")
+    parser.add_argument("--split", default="test_vol", help="Split name to predict (default: test_vol)")
+    parser.add_argument("--batch_size", "--batch-size", type=int, default=8, help="Inference slices per batch")
+    parser.add_argument("--device", default="auto", help="Device (auto, cuda, cpu)")
+    parser.add_argument("--amp", choices=["auto", "none", "fp16", "bf16"], default="auto", help="AMP mode")
+    parser.add_argument("--img_size", type=int, default=128, help="Model image size")
+    parser.add_argument("--num_classes", type=int, default=4, help="Number of canonical classes")
+    parser.add_argument("--measure_efficiency", "--measure-efficiency", action=argparse.BooleanOptionalAction,
+                        default=True, help="Measure Complexity and Inference efficiency metrics")
+    parser.add_argument("--no_measure_efficiency", dest="measure_efficiency", action="store_false", help=argparse.SUPPRESS)
+    parser.add_argument("--efficiency_output", "--efficiency-output", default=None,
+                        help="Optional JSON file to save measured efficiency metrics")
+    return parser
+
+
+def main(argv=None):
+    import evaluate_myops
+    return evaluate_myops.main(argv)
+
+
+if __name__ == "__main__":
+    main()
+
