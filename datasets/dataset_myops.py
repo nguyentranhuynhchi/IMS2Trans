@@ -513,17 +513,9 @@ class MyopsDataset(Dataset):
             img_tensor = torch.from_numpy(np.stack([sample["image"], sample["image1"], sample["image2"]], axis=0)).float()
             label_tensor = torch.from_numpy(sample["label"]).long()
 
-        # Compute low-res label for SAMed mask decoder output resolution (H/4, W/4 = 32, 32)
-        low_res_label = F.interpolate(
-            label_tensor[None, None].float(),
-            size=self.low_res,
-            mode="nearest"
-        )[0, 0].long()
-
         return {
             "image": img_tensor,
             "label": label_tensor,
-            "low_res_label": low_res_label,
             "case_name": name,
             "dataset": self.dataset,
         }

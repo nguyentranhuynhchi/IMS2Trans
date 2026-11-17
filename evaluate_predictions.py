@@ -1,4 +1,4 @@
-"""Standalone Benchmark Prediction Evaluation script for SAMed.
+"""Standalone Benchmark Prediction Evaluation script for IMS2Trans.
 
 Protocols:
   - myops380: myops380_voxel_v3 (Exact SCAR Parity, 76 Cases, Voxel Distance)

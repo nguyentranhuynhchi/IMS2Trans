@@ -1,310 +1,61 @@
-import os
+"""Single-pass deterministic volume inference script for IMS2Trans.
+
+Supports:
+  - MyoPS380 (76 Held-Out Test Volumes)
+  - MyoPS++ (16 Held-Out Test Volumes)
+
+Key Requirements:
+  - Checkpoint loading: <run_dir>/checkpoints/ims2trans_seed<seed>.pt
+  - Single-pass model.eval(), torch.inference_mode()
+  - Process all cases from test_vol.txt (76 cases for myops380, 16 cases for myopspp)
+  - Slice batching with bilinear spatial resizing (if H, W != img_size)
+  - Strict NO test-time augmentation (TTA)
+  - Strict NO post-processing / largest connected component (LCC)
+  - Export: <run_dir>/test_predictions/<CaseID>_pred.npz with key 'prediction' (uint8, [0..3] canonical)
+"""
+from __future__ import annotations
+
+import argparse
+import json
 import logging
-import torch
-import torch.nn.functional as F
-import torch.backends.cudnn as cudnn
+import os
+from pathlib import Path
+import sys
+import time
+from typing import Optional
+
 import numpy as np
-import scipy.misc
-import medpy.io as medio
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
 
-cudnn.benchmark = True
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-path = os.path.dirname(__file__)
-
-patch_size = 128
-
-
-def softmax_output_dice_class4(output, target):
-    eps = 1e-8
-    #######label1########
-    o1 = (output == 1).float()
-    t1 = (target == 1).float()
-    intersect1 = torch.sum(2 * (o1 * t1), dim=(1, 2, 3)) + eps
-    denominator1 = torch.sum(o1, dim=(1, 2, 3)) + torch.sum(t1, dim=(1, 2, 3)) + eps
-    ncr_net_dice = intersect1 / denominator1
-
-    o2 = (output == 2).float()
-    t2 = (target == 2).float()
-    intersect2 = torch.sum(2 * (o2 * t2), dim=(1, 2, 3)) + eps
-    denominator2 = torch.sum(o2, dim=(1, 2, 3)) + torch.sum(t2, dim=(1, 2, 3)) + eps
-    edema_dice = intersect2 / denominator2
-
-    o3 = (output == 3).float()
-    t3 = (target == 3).float()
-    intersect3 = torch.sum(2 * (o3 * t3), dim=(1, 2, 3)) + eps
-    denominator3 = torch.sum(o3, dim=(1, 2, 3)) + torch.sum(t3, dim=(1, 2, 3)) + eps
-    enhancing_dice = intersect3 / denominator3
-
-    ####post processing:
-    if torch.sum(o3) < 500:
-        o4 = o3 * 0.0
-    else:
-        o4 = o3
-    t4 = t3
-    intersect4 = torch.sum(2 * (o4 * t4), dim=(1, 2, 3)) + eps
-    denominator4 = torch.sum(o4, dim=(1, 2, 3)) + torch.sum(t4, dim=(1, 2, 3)) + eps
-    enhancing_dice_postpro = intersect4 / denominator4
-
-    o_whole = o1 + o2 + o3
-    t_whole = t1 + t2 + t3
-    intersect_whole = torch.sum(2 * (o_whole * t_whole), dim=(1, 2, 3)) + eps
-    denominator_whole = (
-        torch.sum(o_whole, dim=(1, 2, 3)) + torch.sum(t_whole, dim=(1, 2, 3)) + eps
-    )
-    dice_whole = intersect_whole / denominator_whole
-
-    o_core = o1 + o3
-    t_core = t1 + t3
-    intersect_core = torch.sum(2 * (o_core * t_core), dim=(1, 2, 3)) + eps
-    denominator_core = (
-        torch.sum(o_core, dim=(1, 2, 3)) + torch.sum(t_core, dim=(1, 2, 3)) + eps
-    )
-    dice_core = intersect_core / denominator_core
-
-    dice_separate = torch.cat(
-        (
-            torch.unsqueeze(ncr_net_dice, 1),
-            torch.unsqueeze(edema_dice, 1),
-            torch.unsqueeze(enhancing_dice, 1),
-        ),
-        dim=1,
-    )
-    dice_evaluate = torch.cat(
-        (
-            torch.unsqueeze(dice_whole, 1),
-            torch.unsqueeze(dice_core, 1),
-            torch.unsqueeze(enhancing_dice, 1),
-            torch.unsqueeze(enhancing_dice_postpro, 1),
-        ),
-        dim=1,
-    )
-
-    return dice_separate.cpu().numpy(), dice_evaluate.cpu().numpy()
+from datasets.dataset_myops import (
+    CLASS_NAMES,
+    MyopsDataset,
+    normalize_dataset_name,
+    resolve_default_list_dir,
+)
+from models.ims2trans_2d import IMS2Trans2D
+from utils.metrics import BENCHMARK_PROTOCOLS
 
 
-def softmax_output_dice_class5(output, target):
-    eps = 1e-8
-    #######label1########
-    o1 = (output == 1).float()
-    t1 = (target == 1).float()
-    intersect1 = torch.sum(2 * (o1 * t1), dim=(1, 2, 3)) + eps
-    denominator1 = torch.sum(o1, dim=(1, 2, 3)) + torch.sum(t1, dim=(1, 2, 3)) + eps
-    necrosis_dice = intersect1 / denominator1
-
-    o2 = (output == 2).float()
-    t2 = (target == 2).float()
-    intersect2 = torch.sum(2 * (o2 * t2), dim=(1, 2, 3)) + eps
-    denominator2 = torch.sum(o2, dim=(1, 2, 3)) + torch.sum(t2, dim=(1, 2, 3)) + eps
-    edema_dice = intersect2 / denominator2
-
-    o3 = (output == 3).float()
-    t3 = (target == 3).float()
-    intersect3 = torch.sum(2 * (o3 * t3), dim=(1, 2, 3)) + eps
-    denominator3 = torch.sum(o3, dim=(1, 2, 3)) + torch.sum(t3, dim=(1, 2, 3)) + eps
-    non_enhancing_dice = intersect3 / denominator3
-
-    o4 = (output == 4).float()
-    t4 = (target == 4).float()
-    intersect4 = torch.sum(2 * (o4 * t4), dim=(1, 2, 3)) + eps
-    denominator4 = torch.sum(o4, dim=(1, 2, 3)) + torch.sum(t4, dim=(1, 2, 3)) + eps
-    enhancing_dice = intersect4 / denominator4
-
-    ####post processing:
-    if torch.sum(o4) < 500:
-        o5 = o4 * 0
-    else:
-        o5 = o4
-    t5 = t4
-    intersect5 = torch.sum(2 * (o5 * t5), dim=(1, 2, 3)) + eps
-    denominator5 = torch.sum(o5, dim=(1, 2, 3)) + torch.sum(t5, dim=(1, 2, 3)) + eps
-    enhancing_dice_postpro = intersect5 / denominator5
-
-    o_whole = o1 + o2 + o3 + o4
-    t_whole = t1 + t2 + t3 + t4
-    intersect_whole = torch.sum(2 * (o_whole * t_whole), dim=(1, 2, 3)) + eps
-    denominator_whole = (
-        torch.sum(o_whole, dim=(1, 2, 3)) + torch.sum(t_whole, dim=(1, 2, 3)) + eps
-    )
-    dice_whole = intersect_whole / denominator_whole
-
-    o_core = o1 + o3 + o4
-    t_core = t1 + t3 + t4
-    intersect_core = torch.sum(2 * (o_core * t_core), dim=(1, 2, 3)) + eps
-    denominator_core = (
-        torch.sum(o_core, dim=(1, 2, 3)) + torch.sum(t_core, dim=(1, 2, 3)) + eps
-    )
-    dice_core = intersect_core / denominator_core
-
-    dice_separate = torch.cat(
-        (
-            torch.unsqueeze(necrosis_dice, 1),
-            torch.unsqueeze(edema_dice, 1),
-            torch.unsqueeze(non_enhancing_dice, 1),
-            torch.unsqueeze(enhancing_dice, 1),
-        ),
-        dim=1,
-    )
-    dice_evaluate = torch.cat(
-        (
-            torch.unsqueeze(dice_whole, 1),
-            torch.unsqueeze(dice_core, 1),
-            torch.unsqueeze(enhancing_dice, 1),
-            torch.unsqueeze(enhancing_dice_postpro, 1),
-        ),
-        dim=1,
-    )
-
-    return dice_separate.cpu().numpy(), dice_evaluate.cpu().numpy()
-
-
-def test_softmax(
-    test_loader, model, dataname="BRATS2020", feature_mask=None, mask_name=None
-):
-
-    H, W, T = 240, 240, 155
-    model.eval()
-    vals_evaluation = AverageMeter()
-    vals_separate = AverageMeter()
-    one_tensor = torch.ones(1, patch_size, patch_size, patch_size).float().cuda()
-
-    if dataname in ["BRATS2021", "BRATS2020", "BRATS2018"]:
-        num_cls = 4
-        class_evaluation = "whole", "core", "enhancing", "enhancing_postpro"
-        class_separate = "ncr_net", "edema", "enhancing"
-    elif dataname == "BRATS2015":
-        num_cls = 5
-        class_evaluation = "whole", "core", "enhancing", "enhancing_postpro"
-        class_separate = "necrosis", "edema", "non_enhancing", "enhancing"
-
-    for i, data in enumerate(test_loader):
-        target = data[1].cuda()
-        x = data[0].cuda()
-        names = data[-1]
-        if feature_mask is not None:
-            mask = torch.from_numpy(np.array(feature_mask))
-            mask = torch.unsqueeze(mask, dim=0).repeat(len(names), 1)
-        else:
-            mask = data[2]
-        mask = mask.cuda()
-        _, _, H, W, Z = x.size()
-        #########get h_ind, w_ind, z_ind for sliding windows
-        h_cnt = np.int(np.ceil((H - patch_size) / (patch_size * (1 - 0.5))))
-        h_idx_list = range(0, h_cnt)
-        h_idx_list = [h_idx * np.int(patch_size * (1 - 0.5)) for h_idx in h_idx_list]
-        h_idx_list.append(H - patch_size)
-
-        w_cnt = np.int(np.ceil((W - patch_size) / (patch_size * (1 - 0.5))))
-        w_idx_list = range(0, w_cnt)
-        w_idx_list = [w_idx * np.int(patch_size * (1 - 0.5)) for w_idx in w_idx_list]
-        w_idx_list.append(W - patch_size)
-
-        z_cnt = np.int(np.ceil((Z - patch_size) / (patch_size * (1 - 0.5))))
-        z_idx_list = range(0, z_cnt)
-        z_idx_list = [z_idx * np.int(patch_size * (1 - 0.5)) for z_idx in z_idx_list]
-        z_idx_list.append(Z - patch_size)
-
-        #####compute calculation times for each pixel in sliding windows
-        weight1 = torch.zeros(1, 1, H, W, Z).float().cuda()
-        for h in h_idx_list:
-            for w in w_idx_list:
-                for z in z_idx_list:
-                    weight1[
-                        :, :, h : h + patch_size, w : w + patch_size, z : z + patch_size
-                    ] += one_tensor
-        weight = weight1.repeat(len(names), num_cls, 1, 1, 1)
-
-        #####evaluation
-        pred = torch.zeros(len(names), num_cls, H, W, Z).float().cuda()
-        model.module.is_training = False
-        for h in h_idx_list:
-            for w in w_idx_list:
-                for z in z_idx_list:
-                    x_input = x[
-                        :, :, h : h + patch_size, w : w + patch_size, z : z + patch_size
-                    ]
-                    pred_part = model(x_input, mask)
-                    pred[
-                        :, :, h : h + patch_size, w : w + patch_size, z : z + patch_size
-                    ] += pred_part
-        pred = pred / weight
-
-        pred = pred[:, :, :H, :W, :T]
-        pred = torch.argmax(pred, dim=1)
-
-        if dataname in ["BRATS2021", "BRATS2020", "BRATS2018"]:
-            scores_separate, scores_evaluation = softmax_output_dice_class4(
-                pred, target
-            )
-        elif dataname == "BRATS2015":
-            scores_separate, scores_evaluation = softmax_output_dice_class5(
-                pred, target
-            )
-        for k, name in enumerate(names):
-            msg = "Subject {}/{}, {}/{}".format(
-                (i + 1), len(test_loader), (k + 1), len(names)
-            )
-            msg += "{:>20}, ".format(name)
-
-            vals_separate.update(scores_separate[k])
-            vals_evaluation.update(scores_evaluation[k])
-            msg += ", ".join(
-                [
-                    "{}: {:.4f}".format(k, v)
-                    for k, v in zip(class_evaluation, scores_evaluation[k])
-                ]
-            )
-
-            logging.info(msg)
-    msg = "Average scores:"
-    msg += ", ".join(
-        [
-            "{}: {:.4f}".format(k, v)
-            for k, v in zip(class_evaluation, vals_evaluation.avg)
-        ]
-    )
-
-    print(msg)
-    model.train()
-    return vals_evaluation.avg
-
-
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-
-# ---------------------------------------------------------------------------
-# CLI Parity and Multi-Dataset Support for IMS2Trans Inference
-# ---------------------------------------------------------------------------
-
-def build_parser():
-    import argparse
-    parser = argparse.ArgumentParser(description="IMS2Trans prediction and volume inference", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--checkpoint", default=None, help="Path to ims2trans_seed<seed>.pt checkpoint")
     parser.add_argument("--data_root", "--data-root",
                         default=os.environ.get("MYOPS380_DATA_ROOT", "/content/MyoPS380_dataset/Processed_data"),
                         help="Root folder containing bSSFP, LGE, T2w subdirectories")
     parser.add_argument("--dataset", "--dataset_id", "--dataset-id", default="myops380",
-                        choices=["myops380", "myopspp"],
+                        choices=["myops380", "myopspp", "myopspp_unet2d_roi128_1mm", "myops_380"],
                         help="Benchmark dataset to predict")
     parser.add_argument("--list_dir", "--list-dir", "--split_dir", "--split-dir", default=None,
                         help="Directory containing test_vol.txt (defaults dynamically by dataset)")
     parser.add_argument("--output_dir", "--output-dir", default=None,
-                        help="Inference output directory")
+                        help="Inference output directory; defaults to checkpoint run directory")
     parser.add_argument("--split", default="test_vol", help="Split name to predict (default: test_vol)")
     parser.add_argument("--batch_size", "--batch-size", type=int, default=8, help="Inference slices per batch")
     parser.add_argument("--device", default="auto", help="Device (auto, cuda, cpu)")
@@ -319,11 +70,219 @@ def build_parser():
     return parser
 
 
+def resolve_device(name: str = "auto") -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(name)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but unavailable in this environment.")
+    return device
+
+
+def resolve_amp(mode: str, device: torch.device):
+    if mode == "none" or (mode == "auto" and device.type == "cpu"):
+        return None
+    if device.type != "cuda":
+        raise ValueError("Mixed precision requires CUDA; use --amp none on CPU.")
+    if mode == "bf16":
+        if not torch.cuda.is_bf16_supported():
+            raise ValueError("bfloat16 is not supported on this CUDA device.")
+        return torch.bfloat16
+    if mode == "auto" and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+@torch.inference_mode()
+def predict_volume(model: nn.Module, images: list[np.ndarray], img_size: int = 128, batch_size: int = 8, device=None, amp_dtype=None) -> np.ndarray:
+    """Predict on 3 aligned (128, 128, D) modalities and return canonical (128, 128, D) uint8 labels."""
+    bSSFP, LGE, T2w = [np.asarray(m, dtype=np.float32) for m in images]
+    height, width, depth = bSSFP.shape
+    prediction = np.empty((height, width, depth), dtype=np.uint8)
+
+    model.eval()
+    model.is_training = False
+
+    for start in range(0, depth, batch_size):
+        stop = min(start + batch_size, depth)
+
+        # Transpose to (B, H, W)
+        s_bssfp = torch.from_numpy(np.ascontiguousarray(bSSFP[:, :, start:stop].transpose(2, 0, 1))).to(device)
+        s_lge = torch.from_numpy(np.ascontiguousarray(LGE[:, :, start:stop].transpose(2, 0, 1))).to(device)
+        s_t2w = torch.from_numpy(np.ascontiguousarray(T2w[:, :, start:stop].transpose(2, 0, 1))).to(device)
+
+        # Stack along channel dimension -> (B, 3, 128, 128)
+        batch_input = torch.stack([s_bssfp, s_lge, s_t2w], dim=1)
+
+        if batch_input.shape[-2:] != (img_size, img_size):
+            batch_input = F.interpolate(batch_input, (img_size, img_size), mode="bilinear", align_corners=False)
+
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(amp_dtype is not None)):
+            out = model(batch_input)
+            logits = out[0] if isinstance(out, tuple) else out
+
+        if not torch.isfinite(logits).all():
+            raise FloatingPointError("Non-finite logits encountered during volume inference.")
+
+        if logits.shape[-2:] != (height, width):
+            logits = F.interpolate(logits.float(), (height, width), mode="bilinear", align_corners=False)
+
+        pred_slices = logits.argmax(dim=1).cpu().numpy().astype(np.uint8)
+        prediction[:, :, start:stop] = pred_slices.transpose(1, 2, 0)
+
+    return prediction
+
+
 def main(argv=None):
-    import evaluate_myops
-    return evaluate_myops.main(argv)
+    args = build_parser().parse_args(argv)
+    if not args.checkpoint:
+        raise ValueError("Must provide --checkpoint for volume prediction.")
+
+    norm_dataset = normalize_dataset_name(args.dataset)
+    list_dir = Path(args.list_dir) if args.list_dir else resolve_default_list_dir(norm_dataset)
+
+    checkpoint_path = Path(args.checkpoint).resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint file does not exist: {checkpoint_path}")
+
+    run_dir = checkpoint_path.parent.parent if checkpoint_path.parent.name == "checkpoints" else checkpoint_path.parent
+    output_dir = Path(args.output_dir) if args.output_dir else run_dir
+    pred_dir = output_dir / "test_predictions"
+    pred_dir.mkdir(parents=True, exist_ok=True)
+
+    log_file = output_dir / "predict.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+        handlers=[
+            logging.FileHandler(str(log_file), mode="w", encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+
+    device = resolve_device(args.device)
+    amp_dtype = resolve_amp(args.amp, device)
+    amp_str = "none" if amp_dtype is None else ("bf16" if amp_dtype == torch.bfloat16 else "fp16")
+
+    logging.info(f"=== IMS2Trans Volume Inference on {norm_dataset} ({args.split}) ===")
+    logging.info(f"Checkpoint: {checkpoint_path}")
+    logging.info(f"Output: {pred_dir}")
+    logging.info(f"Device: {device} | AMP: {amp_str}")
+
+    # Build model architecture
+    model = IMS2Trans2D(
+        num_cls=args.num_classes,
+        img_size=args.img_size,
+        depths=(2, 2, 2),
+        model_num_heads=(3, 6, 12),
+        feature_size=24,
+    )
+
+    ckpt_data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    weights = ckpt_data.get("model_state_dict", ckpt_data.get("model", ckpt_data))
+    model.load_state_dict(weights)
+    model.to(device)
+    model.eval()
+
+    if args.measure_efficiency:
+        from utils.efficiency import (
+            count_parameters,
+            measure_flops,
+            measure_inference_efficiency,
+        )
+        params_info = count_parameters(model)
+        flops_info = measure_flops(model, input_shape=(1, 3, args.img_size, args.img_size), device=device)
+        inference_info = measure_inference_efficiency(
+            model,
+            input_shape=(1, 3, args.img_size, args.img_size),
+            device=device,
+            warmup=30 if device.type == "cuda" else 2,
+            repeats=100 if device.type == "cuda" else 5,
+        )
+        logging.info(
+            "Efficiency | Params: Trainable %.2fM / Total %.2fM | FLOPs: %.2f G | Latency: %.2f ms",
+            params_info["trainable_params_m"],
+            params_info["total_params_m"],
+            flops_info["flops_g"],
+            inference_info["latency_ms_per_slice"],
+        )
+        eff_payload = {
+            "model_name": "IMS2Trans",
+            "model_id": "ims2trans",
+            "dataset_id": norm_dataset,
+            "params_info": params_info,
+            "flops_info": flops_info,
+            "inference_info": inference_info,
+        }
+        eff_out = Path(args.efficiency_output) if args.efficiency_output else (output_dir / "efficiency_metrics.json")
+        eff_out.parent.mkdir(parents=True, exist_ok=True)
+        with open(eff_out, "w", encoding="utf-8") as f:
+            json.dump(eff_payload, f, indent=2)
+        logging.info(f"Saved efficiency metrics to: {eff_out}")
+
+    dataset = MyopsDataset(
+        base_dir=args.data_root,
+        list_dir=str(list_dir),
+        split=args.split,
+        dataset=norm_dataset,
+    )
+    exp_cases = 16 if norm_dataset == "myopspp" else 76
+    logging.info(f"Inference dataset contains {len(dataset)} cases (expected: {exp_cases})")
+
+    benchmark_proto = BENCHMARK_PROTOCOLS.get(norm_dataset, BENCHMARK_PROTOCOLS["myops380"])
+    dist_unit = benchmark_proto["distance_unit"]
+
+    for sample in dataset:
+        case = sample["case_name"]
+        images = [sample["image"], sample["image1"], sample["image2"]]
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        start_time = time.perf_counter()
+
+        prediction = predict_volume(
+            model=model,
+            images=images,
+            img_size=args.img_size,
+            batch_size=args.batch_size,
+            device=device,
+            amp_dtype=amp_dtype,
+        )
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elapsed = time.perf_counter() - start_time
+
+        spacing = sample.get("spacing")
+        np.savez_compressed(
+            pred_dir / f"{case}_pred.npz",
+            prediction=prediction,
+            class_names=np.asarray(CLASS_NAMES),
+            spacing=np.asarray(spacing if spacing is not None else [np.nan, np.nan, np.nan]),
+            affine=np.asarray(sample.get("affine", np.full((4, 4), np.nan))),
+            spacing_unit=sample.get("spacing_unit", dist_unit),
+            metric_distance_unit=dist_unit,
+            exported_label_order="canonical",
+            adapter_version="canonical_v1",
+            model_id="ims2trans",
+            dataset=norm_dataset,
+        )
+        if sample.get("has_affine", False):
+            try:
+                import nibabel as nib
+                nifti = nib.Nifti1Image(prediction, np.asarray(sample["affine"]))
+                if sample.get("spacing_unit") == "mm":
+                    nifti.header.set_xyzt_units("mm")
+                nib.save(nifti, pred_dir / f"{case}_pred.nii.gz")
+            except Exception:
+                pass
+
+        logging.info(f"Saved: {case}_pred.npz ({prediction.shape[2]} slices, {elapsed:.3f}s)")
+
+    logging.info(f"=== Completed volume inference for {len(dataset)} cases -> {pred_dir} ===")
 
 
 if __name__ == "__main__":
     main()
-
