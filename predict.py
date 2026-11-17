@@ -151,137 +151,142 @@ def main(argv=None):
     pred_dir.mkdir(parents=True, exist_ok=True)
 
     log_file = output_dir / "predict.log"
+    file_handler = logging.FileHandler(str(log_file), mode="w", encoding="utf-8")
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] %(message)s",
         datefmt="%H:%M:%S",
         force=True,
         handlers=[
-            logging.FileHandler(str(log_file), mode="w", encoding="utf-8"),
+            file_handler,
             logging.StreamHandler(sys.stdout),
         ],
     )
 
-    device = resolve_device(args.device)
-    amp_dtype = resolve_amp(args.amp, device)
-    amp_str = "none" if amp_dtype is None else ("bf16" if amp_dtype == torch.bfloat16 else "fp16")
+    try:
+        device = resolve_device(args.device)
+        amp_dtype = resolve_amp(args.amp, device)
+        amp_str = "none" if amp_dtype is None else ("bf16" if amp_dtype == torch.bfloat16 else "fp16")
 
-    logging.info(f"=== IMS2Trans Volume Inference on {norm_dataset} ({args.split}) ===")
-    logging.info(f"Checkpoint: {checkpoint_path}")
-    logging.info(f"Output: {pred_dir}")
-    logging.info(f"Device: {device} | AMP: {amp_str}")
+        logging.info(f"=== IMS2Trans Volume Inference on {norm_dataset} ({args.split}) ===")
+        logging.info(f"Checkpoint: {checkpoint_path}")
+        logging.info(f"Output: {pred_dir}")
+        logging.info(f"Device: {device} | AMP: {amp_str}")
 
-    # Build model architecture
-    model = IMS2Trans2D(
-        num_cls=args.num_classes,
-        img_size=args.img_size,
-        depths=(2, 2, 2),
-        model_num_heads=(3, 6, 12),
-        feature_size=24,
-    )
-
-    ckpt_data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    weights = ckpt_data.get("model_state_dict", ckpt_data.get("model", ckpt_data))
-    model.load_state_dict(weights)
-    model.to(device)
-    model.eval()
-
-    if args.measure_efficiency:
-        from utils.efficiency import (
-            count_parameters,
-            measure_flops,
-            measure_inference_efficiency,
-        )
-        params_info = count_parameters(model)
-        flops_info = measure_flops(model, input_shape=(1, 3, args.img_size, args.img_size), device=device)
-        inference_info = measure_inference_efficiency(
-            model,
-            input_shape=(1, 3, args.img_size, args.img_size),
-            device=device,
-            warmup=30 if device.type == "cuda" else 2,
-            repeats=100 if device.type == "cuda" else 5,
-        )
-        logging.info(
-            "Efficiency | Params: Trainable %.2fM / Total %.2fM | FLOPs: %.2f G | Latency: %.2f ms",
-            params_info["trainable_params_m"],
-            params_info["total_params_m"],
-            flops_info["flops_g"],
-            inference_info["latency_ms_per_slice"],
-        )
-        eff_payload = {
-            "model_name": "IMS2Trans",
-            "model_id": "ims2trans",
-            "dataset_id": norm_dataset,
-            "params_info": params_info,
-            "flops_info": flops_info,
-            "inference_info": inference_info,
-        }
-        eff_out = Path(args.efficiency_output) if args.efficiency_output else (output_dir / "efficiency_metrics.json")
-        eff_out.parent.mkdir(parents=True, exist_ok=True)
-        with open(eff_out, "w", encoding="utf-8") as f:
-            json.dump(eff_payload, f, indent=2)
-        logging.info(f"Saved efficiency metrics to: {eff_out}")
-
-    dataset = MyopsDataset(
-        base_dir=args.data_root,
-        list_dir=str(list_dir),
-        split=args.split,
-        dataset=norm_dataset,
-    )
-    exp_cases = 16 if norm_dataset == "myopspp" else 76
-    logging.info(f"Inference dataset contains {len(dataset)} cases (expected: {exp_cases})")
-
-    benchmark_proto = BENCHMARK_PROTOCOLS.get(norm_dataset, BENCHMARK_PROTOCOLS["myops380"])
-    dist_unit = benchmark_proto["distance_unit"]
-
-    for sample in dataset:
-        case = sample["case_name"]
-        images = [sample["image"], sample["image1"], sample["image2"]]
-
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        start_time = time.perf_counter()
-
-        prediction = predict_volume(
-            model=model,
-            images=images,
+        # Build model architecture
+        model = IMS2Trans2D(
+            num_cls=args.num_classes,
             img_size=args.img_size,
-            batch_size=args.batch_size,
-            device=device,
-            amp_dtype=amp_dtype,
+            depths=(2, 2, 2),
+            model_num_heads=(3, 6, 12),
+            feature_size=24,
         )
 
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        elapsed = time.perf_counter() - start_time
+        ckpt_data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        weights = ckpt_data.get("model_state_dict", ckpt_data.get("model", ckpt_data))
+        model.load_state_dict(weights)
+        model.to(device)
+        model.eval()
 
-        spacing = sample.get("spacing")
-        np.savez_compressed(
-            pred_dir / f"{case}_pred.npz",
-            prediction=prediction,
-            class_names=np.asarray(CLASS_NAMES),
-            spacing=np.asarray(spacing if spacing is not None else [np.nan, np.nan, np.nan]),
-            affine=np.asarray(sample.get("affine", np.full((4, 4), np.nan))),
-            spacing_unit=sample.get("spacing_unit", dist_unit),
-            metric_distance_unit=dist_unit,
-            exported_label_order="canonical",
-            adapter_version="canonical_v1",
-            model_id="ims2trans",
+        if args.measure_efficiency:
+            from utils.efficiency import (
+                count_parameters,
+                measure_flops,
+                measure_inference_efficiency,
+            )
+            params_info = count_parameters(model)
+            flops_info = measure_flops(model, input_shape=(1, 3, args.img_size, args.img_size), device=device)
+            inference_info = measure_inference_efficiency(
+                model,
+                input_shape=(1, 3, args.img_size, args.img_size),
+                device=device,
+                warmup=30 if device.type == "cuda" else 2,
+                repeats=100 if device.type == "cuda" else 5,
+            )
+            logging.info(
+                "Efficiency | Params: Trainable %.2fM / Total %.2fM | FLOPs: %.2f G | Latency: %.2f ms",
+                params_info["trainable_params_m"],
+                params_info["total_params_m"],
+                flops_info["flops_g"],
+                inference_info["latency_ms_per_slice"],
+            )
+            eff_payload = {
+                "model_name": "IMS2Trans",
+                "model_id": "ims2trans",
+                "dataset_id": norm_dataset,
+                "params_info": params_info,
+                "flops_info": flops_info,
+                "inference_info": inference_info,
+            }
+            eff_out = Path(args.efficiency_output) if args.efficiency_output else (output_dir / "efficiency_metrics.json")
+            eff_out.parent.mkdir(parents=True, exist_ok=True)
+            with open(eff_out, "w", encoding="utf-8") as f:
+                json.dump(eff_payload, f, indent=2)
+            logging.info(f"Saved efficiency metrics to: {eff_out}")
+
+        dataset = MyopsDataset(
+            base_dir=args.data_root,
+            list_dir=str(list_dir),
+            split=args.split,
             dataset=norm_dataset,
         )
-        if sample.get("has_affine", False):
-            try:
-                import nibabel as nib
-                nifti = nib.Nifti1Image(prediction, np.asarray(sample["affine"]))
-                if sample.get("spacing_unit") == "mm":
-                    nifti.header.set_xyzt_units("mm")
-                nib.save(nifti, pred_dir / f"{case}_pred.nii.gz")
-            except Exception:
-                pass
+        exp_cases = 16 if norm_dataset == "myopspp" else 76
+        logging.info(f"Inference dataset contains {len(dataset)} cases (expected: {exp_cases})")
 
-        logging.info(f"Saved: {case}_pred.npz ({prediction.shape[2]} slices, {elapsed:.3f}s)")
+        benchmark_proto = BENCHMARK_PROTOCOLS.get(norm_dataset, BENCHMARK_PROTOCOLS["myops380"])
+        dist_unit = benchmark_proto["distance_unit"]
 
-    logging.info(f"=== Completed volume inference for {len(dataset)} cases -> {pred_dir} ===")
+        for sample in dataset:
+            case = sample["case_name"]
+            images = [sample["image"], sample["image1"], sample["image2"]]
+
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            start_time = time.perf_counter()
+
+            prediction = predict_volume(
+                model=model,
+                images=images,
+                img_size=args.img_size,
+                batch_size=args.batch_size,
+                device=device,
+                amp_dtype=amp_dtype,
+            )
+
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            elapsed = time.perf_counter() - start_time
+
+            spacing = sample.get("spacing")
+            np.savez_compressed(
+                pred_dir / f"{case}_pred.npz",
+                prediction=prediction,
+                class_names=np.asarray(CLASS_NAMES),
+                spacing=np.asarray(spacing if spacing is not None else [np.nan, np.nan, np.nan]),
+                affine=np.asarray(sample.get("affine", np.full((4, 4), np.nan))),
+                spacing_unit=sample.get("spacing_unit", dist_unit),
+                metric_distance_unit=dist_unit,
+                exported_label_order="canonical",
+                adapter_version="canonical_v1",
+                model_id="ims2trans",
+                dataset=norm_dataset,
+            )
+            if sample.get("has_affine", False):
+                try:
+                    import nibabel as nib
+                    nifti = nib.Nifti1Image(prediction, np.asarray(sample["affine"]))
+                    if sample.get("spacing_unit") == "mm":
+                        nifti.header.set_xyzt_units("mm")
+                    nib.save(nifti, pred_dir / f"{case}_pred.nii.gz")
+                except Exception:
+                    pass
+
+            logging.info(f"Saved: {case}_pred.npz ({prediction.shape[2]} slices, {elapsed:.3f}s)")
+
+        logging.info(f"=== Completed volume inference for {len(dataset)} cases -> {pred_dir} ===")
+    finally:
+        file_handler.close()
+        logging.getLogger().removeHandler(file_handler)
 
 
 if __name__ == "__main__":

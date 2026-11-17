@@ -62,8 +62,10 @@ def build_parser():
     parser.add_argument("--output_dir", "--output-dir", default=None,
                         help="Evaluation output directory; defaults to pred_dir parent")
     parser.add_argument("--split", default="test_vol", help="Split name to evaluate (default: test_vol)")
-    parser.add_argument("--compute_distance", action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument("--compute-distance", "--compute_distance", dest="compute_distance",
+                        action=argparse.BooleanOptionalAction, default=True,
                         help="Compute Hausdorff and surface distance metrics")
+    parser.add_argument("--no_compute_distance", dest="compute_distance", action="store_false", help=argparse.SUPPRESS)
     parser.add_argument("--measure_efficiency", "--measure-efficiency", action=argparse.BooleanOptionalAction,
                         default=True, help="Measure Complexity and Inference efficiency metrics (requires --checkpoint)")
     parser.add_argument("--no_measure_efficiency", dest="measure_efficiency", action="store_false", help=argparse.SUPPRESS)
