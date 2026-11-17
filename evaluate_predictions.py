@@ -21,9 +21,11 @@ import argparse
 import csv
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import sys
+import time
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -75,6 +77,18 @@ def build_parser():
     return parser
 
 
+def json_safe(val: Any) -> Any:
+    if isinstance(val, dict):
+        return {str(k): json_safe(v) for k, v in val.items()}
+    if isinstance(val, (list, tuple)):
+        return [json_safe(v) for v in val]
+    if isinstance(val, (float, np.floating)):
+        return float(val) if math.isfinite(val) else None
+    if isinstance(val, np.generic):
+        return val.item()
+    return val
+
+
 def load_prediction_file(pred_dir: Path, case_name: str) -> np.ndarray:
     candidates = [
         pred_dir / f"{case_name}_pred.npz",
@@ -115,111 +129,141 @@ def main(argv=None):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     log_file = output_dir / "evaluation.log"
+    file_handler = logging.FileHandler(str(log_file), mode="w", encoding="utf-8")
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] %(message)s",
         datefmt="%H:%M:%S",
         force=True,
         handlers=[
-            logging.FileHandler(str(log_file), mode="w", encoding="utf-8"),
+            file_handler,
             logging.StreamHandler(sys.stdout),
         ],
     )
 
-    logging.info(f"=== Standalone Evaluation on {norm_dataset} ({args.split}) ===")
-    logging.info(f"Predictions: {pred_dir}")
-    logging.info(f"Output: {output_dir}")
+    try:
+        logging.info(f"=== Standalone Evaluation on {norm_dataset} ({args.split}) ===")
+        logging.info(f"Predictions: {pred_dir}")
+        logging.info(f"Output: {output_dir}")
 
-    # Load dataset for ground truth
-    # MyoPS++: already canonical on disk -> label_order='canonical'
-    # MyoPS380: legacy on disk -> label_order='legacy'
-    dataset = MyopsDataset(
-        base_dir=args.data_root,
-        list_dir=list_dir,
-        split=args.split,
-        dataset=norm_dataset,
-    )
-    logging.info(f"Loaded ground truth for {len(dataset)} cases")
-
-    benchmark_proto = BENCHMARK_PROTOCOLS.get(norm_dataset, BENCHMARK_PROTOCOLS["myops380"])
-    dist_unit = benchmark_proto["distance_unit"]
-
-    rows = []
-    for sample in dataset:
-        case = sample["case_name"]
-        target = np.asarray(sample["label"]) if sample["label"] is not None else None
-        if target is None:
-            continue
-
-        prediction = load_prediction_file(pred_dir, case)
-        spacing = sample.get("spacing")
-
-        case_rows = dataset_rows(
-            prediction=prediction,
-            target=target,
-            case=case,
-            compute_distance=args.compute_distance,
-            dataset_id=norm_dataset,
-            spacing=spacing,
+        # Load dataset for ground truth
+        # MyoPS++: already canonical on disk -> label_order='canonical'
+        # MyoPS380: legacy on disk -> label_order='legacy'
+        dataset = MyopsDataset(
+            base_dir=args.data_root,
+            list_dir=list_dir,
+            split=args.split,
+            dataset=norm_dataset,
         )
-        rows.extend(case_rows)
+        logging.info(f"Loaded ground truth for {len(dataset)} cases")
 
-    if not rows:
-        raise ValueError("No evaluation results were generated.")
+        benchmark_proto = BENCHMARK_PROTOCOLS.get(norm_dataset, BENCHMARK_PROTOCOLS["myops380"])
+        dist_unit = benchmark_proto["distance_unit"]
 
-    csv_path = output_dir / "per_case.csv"
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-    logging.info(f"Saved per-case metrics to: {csv_path}")
+        rows = []
+        for sample in dataset:
+            case = sample["case_name"]
+            target = np.asarray(sample["label"]) if sample["label"] is not None else None
+            if target is None:
+                continue
 
-    summary = summarize_dataset_rows(rows, dataset_id=norm_dataset)
-    summary.update({
-        "dataset_id": norm_dataset,
-        "metric_protocol": benchmark_proto["id"],
-        "distance_unit": dist_unit,
-        "exported_label_order": "canonical",
-        "total_cases": len(dataset),
-    })
+            prediction = load_prediction_file(pred_dir, case)
+            spacing = sample.get("spacing")
 
-    json_path = output_dir / "metrics.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-    logging.info(f"Saved summary metrics to: {json_path}")
+            case_rows = dataset_rows(
+                prediction=prediction,
+                target=target,
+                case=case,
+                compute_distance=args.compute_distance,
+                dataset_id=norm_dataset,
+                spacing=spacing,
+            )
+            rows.extend(case_rows)
 
-    # Display Master Benchmark Clinical Table
-    hd95_key = f"mean_hd95_{dist_unit}"
-    scar_dice = (summary.get("scar", {}).get("mean_dice") or 0.0) * 100
-    scar_hd95 = summary.get("scar", {}).get(hd95_key) or 0.0
-    edema_dice = (summary.get("edema_inclusive", {}).get("mean_dice") or 0.0) * 100
-    edema_hd95 = summary.get("edema_inclusive", {}).get(hd95_key) or 0.0
-    edema_excl_dice = (summary.get("edema", {}).get("mean_dice") or 0.0) * 100
-    edema_excl_hd95 = summary.get("edema", {}).get(hd95_key) or 0.0
-    myo_dice = (summary.get("myocardial_ring", {}).get("mean_dice") or 0.0) * 100
-    myo_hd95 = summary.get("myocardial_ring", {}).get(hd95_key) or 0.0
-    avg_path_dice = (summary.get("avg_pathology_inclusive_dice") or 0.0) * 100
-    avg_path_hd95 = summary.get(f"avg_pathology_inclusive_{hd95_key}") or summary.get("avg_pathology_inclusive_hd95_mm") or summary.get("avg_pathology_inclusive_hd95_voxel") or 0.0
-    avg_path_excl_dice = (summary.get("avg_pathology_dice") or 0.0) * 100
-    avg_path_excl_hd95 = summary.get(f"avg_pathology_{hd95_key}") or summary.get("avg_pathology_hd95_mm") or summary.get("avg_pathology_hd95_voxel") or 0.0
+        if not rows:
+            raise ValueError("No evaluation results were generated.")
 
-    table = f"""
+        csv_path = output_dir / "per_case.csv"
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        logging.info(f"Saved per-case metrics to: {csv_path}")
+
+        summary = summarize_dataset_rows(rows, dataset_id=norm_dataset)
+        metrics_payload = {
+            "dataset": norm_dataset,
+            "dataset_id": norm_dataset,
+            "split": args.split,
+            "model_id": "ims2trans",
+            "distance_unit": dist_unit,
+            "benchmark_protocol": benchmark_proto,
+            "summary": summary,
+            "scar": summary.get("scar", {}),
+            "edema": summary.get("edema", {}),
+            "edema_inclusive": summary.get("edema_inclusive", {}),
+            "normal_myocardium": summary.get("normal_myocardium", {}),
+            "myocardial_ring": summary.get("myocardial_ring", {}),
+            "provenance": {
+                "pred_dir": str(pred_dir),
+                "model_id": "ims2trans",
+                "dataset": norm_dataset,
+                "evaluated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "total_cases": len(dataset),
+            },
+        }
+
+        json_path = output_dir / "metrics.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(json_safe(metrics_payload), f, indent=2)
+        logging.info(f"Saved summary metrics to: {json_path}")
+
+        # Display Master Benchmark Clinical Table
+        hd95_key = f"mean_hd95_{dist_unit}"
+        scar_dice = (summary.get("scar", {}).get("mean_dice") or 0.0) * 100
+        scar_hd95 = summary.get("scar", {}).get(hd95_key)
+        scar_hd95_str = f"{scar_hd95:6.2f}" if scar_hd95 is not None else "   N/A"
+
+        edema_dice = (summary.get("edema_inclusive", {}).get("mean_dice") or 0.0) * 100
+        edema_hd95 = summary.get("edema_inclusive", {}).get(hd95_key)
+        edema_hd95_str = f"{edema_hd95:6.2f}" if edema_hd95 is not None else "   N/A"
+
+        edema_excl_dice = (summary.get("edema", {}).get("mean_dice") or 0.0) * 100
+        edema_excl_hd95 = summary.get("edema", {}).get(hd95_key)
+        edema_excl_hd95_str = f"{edema_excl_hd95:6.2f}" if edema_excl_hd95 is not None else "   N/A"
+
+        myo_dice = (summary.get("myocardial_ring", {}).get("mean_dice") or 0.0) * 100
+        myo_hd95 = summary.get("myocardial_ring", {}).get(hd95_key)
+        myo_hd95_str = f"{myo_hd95:6.2f}" if myo_hd95 is not None else "   N/A"
+
+        avg_path_dice = (summary.get("avg_pathology_inclusive_dice") or 0.0) * 100
+        avg_path_hd95 = summary.get(f"avg_pathology_inclusive_{hd95_key}") or summary.get("avg_pathology_inclusive_hd95_mm") or summary.get("avg_pathology_inclusive_hd95_voxel")
+        avg_path_hd95_str = f"{avg_path_hd95:6.2f}" if avg_path_hd95 is not None else "   N/A"
+
+        avg_path_excl_dice = (summary.get("avg_pathology_dice") or 0.0) * 100
+        avg_path_excl_hd95 = summary.get(f"avg_pathology_{hd95_key}") or summary.get("avg_pathology_hd95_mm") or summary.get("avg_pathology_hd95_voxel")
+        avg_path_excl_hd95_str = f"{avg_path_excl_hd95:6.2f}" if avg_path_excl_hd95 is not None else "   N/A"
+
+        table = f"""
 =============================================================================================================
 MASTER BENCHMARK EVALUATION RESULTS (Protocol: {benchmark_proto['id']})
 Dataset: {norm_dataset} | Protocol: {benchmark_proto['id']} | Cases: {len(dataset)}
 -------------------------------------------------------------------------------------------------------------
 Region                   | Dice (%)       | HD95 ({dist_unit})
 -------------------------------------------------------------------------------------------------------------
-Scar                     | {scar_dice:6.2f}         | {scar_hd95:6.2f}
-Edema (Inclusive / AAR)  | {edema_dice:6.2f}         | {edema_hd95:6.2f}
-Edema (Exclusive)        | {edema_excl_dice:6.2f}         | {edema_excl_hd95:6.2f}
-Myocardium (Whole Ring)  | {myo_dice:6.2f}         | {myo_hd95:6.2f}
+Scar                     | {scar_dice:6.2f}         | {scar_hd95_str}
+Edema (Inclusive / AAR)  | {edema_dice:6.2f}         | {edema_hd95_str}
+Edema (Exclusive)        | {edema_excl_dice:6.2f}         | {edema_excl_hd95_str}
+Myocardium (Whole Ring)  | {myo_dice:6.2f}         | {myo_hd95_str}
 -------------------------------------------------------------------------------------------------------------
-Avg. Pathology (Incl.)   | {avg_path_dice:6.2f}         | {avg_path_hd95:6.2f}
-Avg. Pathology (Excl.)   | {avg_path_excl_dice:6.2f}         | {avg_path_excl_hd95:6.2f}
+Avg. Pathology (Incl.)   | {avg_path_dice:6.2f}         | {avg_path_hd95_str}
+Avg. Pathology (Excl.)   | {avg_path_excl_dice:6.2f}         | {avg_path_excl_hd95_str}
 =============================================================================================================
 """
-    logging.info(table)
+        logging.info(table)
+    finally:
+        file_handler.close()
+        logging.getLogger().removeHandler(file_handler)
 
 
 if __name__ == "__main__":
